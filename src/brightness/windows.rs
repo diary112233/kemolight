@@ -1,4 +1,6 @@
-use std::{mem, ptr};
+use std::{mem, process::Command, ptr};
+
+use std::os::windows::process::CommandExt;
 
 use windows_sys::{
     core::BOOL,
@@ -10,7 +12,10 @@ use windows_sys::{
             PHYSICAL_MONITOR,
         },
         Foundation::{HANDLE, LPARAM, RECT},
-        Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
+        Graphics::Gdi::{
+            EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC,
+            HMONITOR, MONITORINFOEXW,
+        },
     },
 };
 
@@ -20,15 +25,41 @@ use super::{
 };
 
 const ID_PREFIX: &str = "windows-ddcci:";
+const WMI_ID_PREFIX: &str = "windows-wmi:";
+const POWERSHELL: &str = "powershell.exe";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct WindowsBrightnessBackend;
 
 impl BrightnessBackend for WindowsBrightnessBackend {
     fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
-        let monitors = enumerate_physical_monitors()?;
-        let mut displays = Vec::with_capacity(monitors.len());
+        let mut displays = Vec::new();
+        let mut first_error = None;
+
+        match list_wmi_displays() {
+            Ok(mut detected) => displays.append(&mut detected),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+        let internal_hardware_ids = wmi_display_hardware_ids(&displays);
+
+        let monitors = match enumerate_physical_monitors() {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                if displays.is_empty() {
+                    return Err(error);
+                }
+                first_error.get_or_insert(error);
+                Vec::new()
+            }
+        };
 
         for monitor in monitors {
+            if monitor.matches_hardware_ids(&internal_hardware_ids) {
+                continue;
+            }
+
             let brightness = monitor.get_brightness();
             let supports_brightness = monitor.supports_brightness() || brightness.is_ok();
             let current = brightness.ok().map(|value| value.percent());
@@ -43,16 +74,184 @@ impl BrightnessBackend for WindowsBrightnessBackend {
             });
         }
 
+        if displays.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+
         Ok(displays)
     }
 
     fn get_brightness(&self, display_id: &DisplayId) -> Result<BrightnessValue> {
+        if display_id.as_str().starts_with(WMI_ID_PREFIX) {
+            return wmi_get_brightness(display_id);
+        }
+
         find_monitor(display_id)?.get_brightness()
     }
 
     fn set_brightness(&self, display_id: &DisplayId, value: u32) -> Result<()> {
+        if display_id.as_str().starts_with(WMI_ID_PREFIX) {
+            return wmi_set_brightness(display_id, value);
+        }
+
         find_monitor(display_id)?.set_brightness(value)
     }
+}
+
+fn list_wmi_displays() -> Result<Vec<DisplayInfo>> {
+    let output = powershell_output(
+        r#"$items = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object { $_.Active })
+for ($i = 0; $i -lt $items.Count; $i++) {
+    $item = $items[$i]
+    "$i|$($item.CurrentBrightness)|$($item.InstanceName)"
+}"#,
+    )?;
+
+    Ok(parse_wmi_list(&output))
+}
+
+fn wmi_display_hardware_ids(displays: &[DisplayInfo]) -> Vec<String> {
+    displays
+        .iter()
+        .filter_map(|display| {
+            display
+                .name
+                .strip_prefix("Internal Display ")
+                .map(normalize_hardware_id)
+        })
+        .collect()
+}
+
+fn wmi_get_brightness(display_id: &DisplayId) -> Result<BrightnessValue> {
+    let index = wmi_display_index(display_id)?;
+    let script = format!(
+        r#"$items = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active }})
+if ({index} -ge $items.Count) {{ exit 2 }}
+$items[{index}].CurrentBrightness"#
+    );
+    let output = powershell_output(&script)?;
+    let current = output
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+        .ok_or_else(|| {
+            BrightnessError::BackendUnavailable("could not parse WMI brightness".into())
+        })?;
+
+    Ok(BrightnessValue {
+        current: clamp_percent(current),
+        max: 100,
+    })
+}
+
+fn wmi_set_brightness(display_id: &DisplayId, value: u32) -> Result<()> {
+    let index = wmi_display_index(display_id)?;
+    let value = clamp_percent(value);
+    let script = format!(
+        r#"$brightness = {value}
+$brightnessItems = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active }})
+if ({index} -ge $brightnessItems.Count) {{ exit 2 }}
+$instanceName = $brightnessItems[{index}].InstanceName
+$methodItems = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | Where-Object {{ $_.InstanceName -eq $instanceName }})
+if ($methodItems.Count -eq 0) {{ exit 3 }}
+Invoke-CimMethod -InputObject $methodItems[0] -MethodName WmiSetBrightness -Arguments @{{ Timeout = 1; Brightness = $brightness }} | Out-Null"#
+    );
+    powershell_output(&script).map(|_| ())
+}
+
+fn wmi_display_index(display_id: &DisplayId) -> Result<usize> {
+    display_id
+        .as_str()
+        .strip_prefix(WMI_ID_PREFIX)
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| BrightnessError::DisplayNotFound(display_id.clone()))
+}
+
+fn powershell_output(script: &str) -> Result<String> {
+    let output = Command::new(POWERSHELL)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                BrightnessError::CommandNotFound("powershell.exe".to_string())
+            } else {
+                BrightnessError::from(err)
+            }
+        })?;
+
+    if !output.status.success() {
+        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let message = text.trim();
+        return Err(BrightnessError::BackendUnavailable(if message.is_empty() {
+            "Windows WMI brightness command failed".to_string()
+        } else {
+            message.to_string()
+        }));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_wmi_list(output: &str) -> Vec<DisplayInfo> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, '|');
+            let index = parts.next()?.parse::<usize>().ok()?;
+            let current = parts.next()?.parse::<u32>().ok().map(clamp_percent);
+            let instance_name = parts.next().unwrap_or_default().trim();
+            Some(DisplayInfo {
+                id: DisplayId::new(format!("{WMI_ID_PREFIX}{index}")),
+                name: wmi_display_name(index, instance_name),
+                kind: DisplayKind::InternalBacklight,
+                current,
+                max: 100,
+                supported: current.is_some(),
+            })
+        })
+        .collect()
+}
+
+fn wmi_display_name(index: usize, instance_name: &str) -> String {
+    let label = hardware_id_from_device_instance(instance_name);
+
+    match label.as_deref() {
+        Some(label) => format!("Internal Display {label}"),
+        None => format!("Internal Display {}", index + 1),
+    }
+}
+
+fn hardware_id_from_device_instance(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut parts = value.split('\\');
+    let prefix = parts.next()?;
+    if !matches!(prefix, "DISPLAY" | "MONITOR") {
+        return None;
+    }
+
+    parts
+        .next()
+        .filter(|id| !id.is_empty())
+        .map(normalize_hardware_id)
+}
+
+fn normalize_hardware_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +293,7 @@ struct PhysicalMonitor {
     address: MonitorAddress,
     handle: HANDLE,
     description: String,
+    hardware_id: Option<String>,
 }
 
 impl PhysicalMonitor {
@@ -111,6 +311,21 @@ impl PhysicalMonitor {
         } else {
             self.description.clone()
         }
+    }
+
+    fn matches_hardware_ids(&self, hardware_ids: &[String]) -> bool {
+        if hardware_ids.is_empty() {
+            return false;
+        }
+
+        if let Some(hardware_id) = self.hardware_id.as_ref() {
+            return hardware_ids.iter().any(|id| id == hardware_id);
+        }
+
+        let description = normalize_hardware_id(&self.description);
+        hardware_ids
+            .iter()
+            .any(|id| !id.is_empty() && description.contains(id))
     }
 
     fn supports_brightness(&self) -> bool {
@@ -163,6 +378,10 @@ impl PhysicalMonitor {
 
 impl Drop for PhysicalMonitor {
     fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+
         unsafe {
             DestroyPhysicalMonitor(self.handle);
         }
@@ -224,6 +443,7 @@ fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
 
     let mut monitors = Vec::new();
     for (logical_index, hmonitor) in hmonitors.into_iter().enumerate() {
+        let hardware_id = monitor_hardware_id(hmonitor);
         let physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
         for (physical_index, physical_monitor) in physical_monitors.monitors.iter().enumerate() {
             let description = physical_monitor.szPhysicalMonitorDescription;
@@ -234,6 +454,7 @@ fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
                 },
                 handle: physical_monitor.hPhysicalMonitor,
                 description: wide_to_string(&description),
+                hardware_id: hardware_id.clone(),
             });
         }
         mem::forget(physical_monitors);
@@ -251,6 +472,27 @@ unsafe extern "system" fn enum_monitor(
     let monitors = &mut *(data as *mut Vec<HMONITOR>);
     monitors.push(hmonitor);
     1
+}
+
+fn monitor_hardware_id(hmonitor: HMONITOR) -> Option<String> {
+    let mut monitor_info = MONITORINFOEXW::default();
+    monitor_info.monitorInfo.cbSize = mem::size_of::<MONITORINFOEXW>() as u32;
+
+    let ok = unsafe { GetMonitorInfoW(hmonitor, &mut monitor_info as *mut _ as *mut _) };
+    if ok == 0 {
+        return None;
+    }
+
+    let mut device = DISPLAY_DEVICEW {
+        cb: mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 0, &mut device, 0) };
+    if ok == 0 {
+        return None;
+    }
+
+    hardware_id_from_device_instance(&wide_to_string(&device.DeviceID))
 }
 
 fn find_monitor(display_id: &DisplayId) -> Result<PhysicalMonitor> {
@@ -300,6 +542,57 @@ mod tests {
 
         assert_eq!(MonitorAddress::parse(&address.id())?, address);
         Ok(())
+    }
+
+    #[test]
+    fn parses_wmi_brightness_displays() {
+        let output = r#"0|60|DISPLAY\SDC420B\4&1a2d752c&0&UID8388688_0
+1|35|DISPLAY\ABC1234\5&11111111&0&UID1234567_0
+"#;
+
+        let displays = parse_wmi_list(output);
+        assert_eq!(displays.len(), 2);
+        assert_eq!(displays[0].id.as_str(), "windows-wmi:0");
+        assert_eq!(displays[0].name, "Internal Display SDC420B");
+        assert_eq!(displays[0].kind, DisplayKind::InternalBacklight);
+        assert_eq!(displays[0].current, Some(60));
+        assert!(displays[0].supported);
+    }
+
+    #[test]
+    fn parses_wmi_display_index() -> Result<()> {
+        assert_eq!(wmi_display_index(&DisplayId::new("windows-wmi:3"))?, 3);
+        assert!(wmi_display_index(&DisplayId::new("windows-ddcci:0:0")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_normalized_monitor_hardware_id() {
+        assert_eq!(
+            hardware_id_from_device_instance(r"DISPLAY\SDC420B\4&abc"),
+            Some("SDC420B".to_string())
+        );
+        assert_eq!(
+            hardware_id_from_device_instance(r"MONITOR\sdc420b\4&abc"),
+            Some("SDC420B".to_string())
+        );
+        assert_eq!(hardware_id_from_device_instance(r"PCI\VEN_1234"), None);
+    }
+
+    #[test]
+    fn physical_monitor_matches_wmi_hardware_id() {
+        let monitor = PhysicalMonitor {
+            address: MonitorAddress {
+                logical_index: 0,
+                physical_index: 0,
+            },
+            handle: std::ptr::null_mut(),
+            description: "Generic PnP Monitor".to_string(),
+            hardware_id: Some("SDC420B".to_string()),
+        };
+
+        assert!(monitor.matches_hardware_ids(&["SDC420B".to_string()]));
+        assert!(!monitor.matches_hardware_ids(&["DEL1234".to_string()]));
     }
 
     #[test]

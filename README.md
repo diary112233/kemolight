@@ -49,6 +49,7 @@ Log out and back in after changing groups. If `ddcutil detect` reports permissio
 - Main window: egui/eframe native window.
 - System tray: native Windows notification area icon using `Shell_NotifyIconW`.
 - Tray menu: open window, refresh displays, set brightness presets, adjust brightness, and quit.
+- Internal laptop panels: Windows WMI/CIM brightness APIs.
 - External monitors: Windows Monitor Configuration API over DDC/CI.
 - Only monitors that report brightness support through Windows DDC/CI APIs are enabled. Unsupported monitors are listed but their controls are disabled.
 
@@ -97,7 +98,7 @@ preferred_backend = "auto" # auto, ddcutil, sysfs, mock
 - `linux-ddcutil`: enables external monitor control through `ddcutil`.
 - `mock-backend`: includes a mock backend for development and tests.
 
-Default features enable tray, linux-ddcutil, and mock-backend. Linux tray and ddcutil dependencies are only built on Linux. Windows tray support is built through `Shell_NotifyIconW`; Windows DDC/CI support is built through the Windows Monitor Configuration API. eframe provides Wayland and X11 support through its default native features; the app chooses X11/XWayland when tray hiding is available.
+Default features enable tray, linux-ddcutil, and mock-backend. Linux tray and ddcutil dependencies are only built on Linux. Windows tray support is built through `Shell_NotifyIconW`; Windows internal panel support is built through WMI/CIM; Windows DDC/CI support is built through the Windows Monitor Configuration API. eframe provides Wayland and X11 support through its default native features; the app chooses X11/XWayland when tray hiding is available.
 
 ## Current TODOs
 
