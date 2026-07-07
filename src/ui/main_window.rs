@@ -10,7 +10,7 @@ use crate::{
     brightness::DisplayId,
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PENDING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const SLIDER_DEBOUNCE: Duration = Duration::from_millis(250);
 const DISPLAY_NAME_WIDTH: f32 = 170.0;
 const PERCENT_WIDTH: f32 = 48.0;
@@ -78,7 +78,6 @@ impl MainWindow {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
         }
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-        ctx.request_repaint_after(POLL_INTERVAL);
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -104,12 +103,20 @@ impl MainWindow {
     }
 
     fn schedule_repaint(&self, now: Instant, ctx: &egui::Context) {
-        let delay = self
-            .commits
-            .next_due(now)
-            .unwrap_or(POLL_INTERVAL)
-            .min(POLL_INTERVAL);
-        ctx.request_repaint_after(delay);
+        if let Some(delay) = self.commits.next_due(now) {
+            ctx.request_repaint_after(delay.min(SLIDER_DEBOUNCE));
+            return;
+        }
+
+        if self
+            .controller
+            .snapshot()
+            .displays
+            .iter()
+            .any(|display| display.pending)
+        {
+            ctx.request_repaint_after(PENDING_REPAINT_INTERVAL);
+        }
     }
 
     fn queue_slider_value(&mut self, display_id: DisplayId, value: u32) {
