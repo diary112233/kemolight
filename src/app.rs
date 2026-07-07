@@ -69,6 +69,7 @@ struct AppControllerInner {
     brightness_tx: Sender<BrightnessCommand>,
     state_tx: Sender<()>,
     state_rx: Mutex<Receiver<()>>,
+    repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
     tray_update_tx: Arc<Mutex<Option<Sender<()>>>>,
     app_tx: Sender<AppCommand>,
     app_rx: Mutex<Receiver<AppCommand>>,
@@ -88,6 +89,7 @@ impl AppController {
         let (state_tx, state_rx) = mpsc::channel();
         let (app_tx, app_rx) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(AppSnapshot::default()));
+        let repaint_ctx = Arc::new(Mutex::new(None));
         let tray_update_tx = Arc::new(Mutex::new(None));
 
         spawn_brightness_worker(
@@ -95,6 +97,7 @@ impl AppController {
             Arc::clone(&snapshot),
             brightness_rx,
             state_tx.clone(),
+            Arc::clone(&repaint_ctx),
             Arc::clone(&tray_update_tx),
             config.normalized_step(),
         );
@@ -106,6 +109,7 @@ impl AppController {
                 brightness_tx,
                 state_tx,
                 state_rx: Mutex::new(state_rx),
+                repaint_ctx,
                 tray_update_tx,
                 app_tx,
                 app_rx: Mutex::new(app_rx),
@@ -118,6 +122,13 @@ impl AppController {
 
     pub fn config(&self) -> &AppConfig {
         &self.inner.config
+    }
+
+    pub fn set_repaint_context(&self, ctx: egui::Context) {
+        if let Ok(mut repaint_ctx) = self.inner.repaint_ctx.lock() {
+            *repaint_ctx = Some(ctx.clone());
+        }
+        ctx.request_repaint();
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
@@ -164,6 +175,7 @@ impl AppController {
             request_id,
         );
         notify_state_changed(&self.inner.state_tx);
+        self.request_repaint();
         request_id
     }
 
@@ -177,14 +189,17 @@ impl AppController {
 
     pub fn request_open_window(&self) {
         let _ = self.inner.app_tx.send(AppCommand::OpenWindow);
+        self.request_repaint();
     }
 
     pub fn request_hide_window(&self) {
         let _ = self.inner.app_tx.send(AppCommand::HideWindow);
+        self.request_repaint();
     }
 
     pub fn request_quit(&self) {
         let _ = self.inner.app_tx.send(AppCommand::Quit);
+        self.request_repaint();
     }
 
     pub fn shutdown(&self) {
@@ -216,6 +231,10 @@ impl AppController {
 
     fn request_tray_update(&self) {
         notify_tray_changed(&self.inner.tray_update_tx);
+    }
+
+    fn request_repaint(&self) {
+        request_repaint(&self.inner.repaint_ctx);
     }
 
     pub fn drain_state_events(&self) -> bool {
@@ -293,6 +312,7 @@ fn run_main_window(
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
             .with_app_id(APP_ID)
+            .with_icon(crate::logo::app_icon(64))
             .with_inner_size([560.0, 320.0])
             .with_min_inner_size([420.0, 240.0])
             .with_visible(start_visible),
@@ -306,7 +326,7 @@ fn run_main_window(
         APP_TITLE,
         native_options,
         Box::new(move |creation_context| {
-            creation_context.egui_ctx.request_repaint();
+            app_controller.set_repaint_context(creation_context.egui_ctx.clone());
             Ok(Box::new(ui::main_window::MainWindow::new(
                 app_controller.clone(),
                 start_visible,
@@ -357,12 +377,14 @@ fn spawn_brightness_worker(
     snapshot: Arc<Mutex<AppSnapshot>>,
     rx: Receiver<BrightnessCommand>,
     state_tx: Sender<()>,
+    repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
     tray_update_tx: Arc<Mutex<Option<Sender<()>>>>,
     step: u32,
 ) {
     thread::spawn(move || {
         refresh_snapshot(backend.as_ref(), &snapshot);
         notify_state_changed(&state_tx);
+        request_repaint(&repaint_ctx);
         notify_tray_changed(&tray_update_tx);
 
         while let Ok(command) = rx.recv() {
@@ -385,6 +407,7 @@ fn spawn_brightness_worker(
                 BrightnessCommand::Shutdown => break,
             }
             notify_state_changed(&state_tx);
+            request_repaint(&repaint_ctx);
             notify_tray_changed(&tray_update_tx);
         }
     });
@@ -392,6 +415,15 @@ fn spawn_brightness_worker(
 
 fn notify_state_changed(state_tx: &Sender<()>) {
     let _ = state_tx.send(());
+}
+
+fn request_repaint(repaint_ctx: &Arc<Mutex<Option<egui::Context>>>) {
+    let Ok(repaint_ctx) = repaint_ctx.lock() else {
+        return;
+    };
+    if let Some(ctx) = repaint_ctx.as_ref() {
+        ctx.request_repaint();
+    }
 }
 
 fn notify_tray_changed(tray_update_tx: &Arc<Mutex<Option<Sender<()>>>>) {

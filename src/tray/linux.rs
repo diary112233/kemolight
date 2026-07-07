@@ -1,5 +1,8 @@
 use std::{
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self, Receiver},
+        LazyLock,
+    },
     thread,
     time::Duration,
 };
@@ -7,11 +10,13 @@ use std::{
 use crate::{
     app::{AppController, DisplayState},
     brightness::DisplayId,
+    logo,
 };
 
 use super::TrayHandle;
 
 const TRAY_UPDATE_DEBOUNCE: Duration = Duration::from_millis(150);
+const LOGO_ICON_SIZE: i32 = 32;
 
 #[derive(Clone)]
 struct BrightnessTray {
@@ -101,7 +106,12 @@ impl ksni::Tray for BrightnessTray {
     }
 
     fn icon_name(&self) -> String {
-        "display-brightness-symbolic".to_string()
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        static ICON: LazyLock<ksni::Icon> = LazyLock::new(|| logo::tray_icon_argb(LOGO_ICON_SIZE));
+        vec![ICON.clone()]
     }
 
     fn category(&self) -> ksni::Category {
@@ -119,7 +129,6 @@ impl ksni::Tray for BrightnessTray {
         let mut items = vec![
             StandardItem {
                 label: "Open Window".to_string(),
-                icon_name: "window-new".to_string(),
                 activate: Box::new(|this: &mut Self| {
                     this.controller.request_open_window();
                 }),
@@ -128,7 +137,6 @@ impl ksni::Tray for BrightnessTray {
             .into(),
             StandardItem {
                 label: "Refresh Displays".to_string(),
-                icon_name: "view-refresh".to_string(),
                 activate: Box::new(|this: &mut Self| {
                     this.controller.refresh();
                 }),
@@ -169,7 +177,6 @@ impl ksni::Tray for BrightnessTray {
         items.push(
             StandardItem {
                 label: "Quit".to_string(),
-                icon_name: "application-exit".to_string(),
                 activate: Box::new(|this: &mut Self| {
                     this.controller.request_quit();
                 }),
