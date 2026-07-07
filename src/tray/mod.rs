@@ -5,6 +5,8 @@ use crate::app::AppController;
 #[cfg(all(target_os = "linux", feature = "tray"))]
 pub mod linux;
 pub mod mock;
+#[cfg(all(target_os = "windows", feature = "tray"))]
+pub mod windows;
 
 pub struct TrayHandle {
     available: bool,
@@ -84,7 +86,15 @@ pub fn start_tray(controller: AppController) -> TrayHandle {
         linux::start_tray(controller)
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "tray")))]
+    #[cfg(all(target_os = "windows", feature = "tray"))]
+    {
+        windows::start_tray(controller)
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "tray"),
+        all(target_os = "windows", feature = "tray")
+    )))]
     {
         mock::start_tray(controller)
     }
