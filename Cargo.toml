@@ -2,7 +2,7 @@
 name = "kemolight"
 version = "0.1.0"
 edition = "2021"
-description = "A lightweight egui brightness controller for Linux desktops."
+description = "A lightweight egui brightness controller for Linux and Windows desktops."
 license = "MIT OR Apache-2.0"
 
 [features]
@@ -23,6 +23,12 @@ toml = "0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.5", optional = true, default-features = false, features = ["async-io", "blocking"] }
 winit = { version = "0.30.13", default-features = false, features = ["x11"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Devices_Display", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 codegen-units = 1
