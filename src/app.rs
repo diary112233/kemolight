@@ -275,8 +275,8 @@ pub fn run() {
         eprintln!("Failed to load config, using defaults: {err}");
         AppConfig::default()
     });
+    // The brightness worker performs initial discovery before processing commands.
     let controller = AppController::new(config);
-    controller.refresh();
 
     let tray_handle = tray::start_tray(controller.clone());
     controller.set_tray_available(tray_handle.is_available());

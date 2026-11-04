@@ -7,9 +7,8 @@ use windows_sys::{
     Win32::{
         Devices::Display::{
             DestroyPhysicalMonitor, DestroyPhysicalMonitors, GetMonitorBrightness,
-            GetMonitorCapabilities, GetNumberOfPhysicalMonitorsFromHMONITOR,
-            GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, MC_CAPS_BRIGHTNESS,
-            PHYSICAL_MONITOR,
+            GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
+            SetMonitorBrightness, PHYSICAL_MONITOR,
         },
         Foundation::{HANDLE, LPARAM, RECT},
         Graphics::Gdi::{
@@ -60,9 +59,9 @@ impl BrightnessBackend for WindowsBrightnessBackend {
                 continue;
             }
 
-            let brightness = monitor.get_brightness();
-            let supports_brightness = monitor.supports_brightness() || brightness.is_ok();
-            let current = brightness.ok().map(|value| value.percent());
+            // A successful read already establishes brightness support. Querying
+            // all capabilities can take seconds even on readable monitors.
+            let current = monitor.get_brightness().ok().map(|value| value.percent());
 
             displays.push(DisplayInfo {
                 id: monitor.id(),
@@ -70,7 +69,7 @@ impl BrightnessBackend for WindowsBrightnessBackend {
                 kind: DisplayKind::ExternalDdcCi,
                 current,
                 max: 100,
-                supported: supports_brightness && current.is_some(),
+                supported: current.is_some(),
             });
         }
 
@@ -326,15 +325,6 @@ impl PhysicalMonitor {
         hardware_ids
             .iter()
             .any(|id| !id.is_empty() && description.contains(id))
-    }
-
-    fn supports_brightness(&self) -> bool {
-        let mut capabilities = 0;
-        let mut color_temperatures = 0;
-        unsafe {
-            GetMonitorCapabilities(self.handle, &mut capabilities, &mut color_temperatures) != 0
-                && (capabilities & MC_CAPS_BRIGHTNESS) != 0
-        }
     }
 
     fn get_brightness(&self) -> Result<BrightnessValue> {

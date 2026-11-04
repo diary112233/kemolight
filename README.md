@@ -61,6 +61,12 @@ External monitors must have DDC/CI enabled in the monitor OSD. Some HDMI/DP adap
 cargo run
 ```
 
+Measure display discovery and brightness worker initialization without changing brightness:
+
+```bash
+cargo run --locked --example brightness_timing
+```
+
 Useful debugging commands:
 
 ```bash

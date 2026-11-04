@@ -54,6 +54,26 @@ impl Drop for TrayHandle {
     }
 }
 
+pub fn start_tray(controller: AppController) -> TrayHandle {
+    #[cfg(all(target_os = "linux", feature = "tray"))]
+    {
+        linux::start_tray(controller)
+    }
+
+    #[cfg(all(target_os = "windows", feature = "tray"))]
+    {
+        windows::start_tray(controller)
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "tray"),
+        all(target_os = "windows", feature = "tray")
+    )))]
+    {
+        mock::start_tray(controller)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,25 +97,5 @@ mod tests {
         assert!(handle.update_sender().is_some());
         assert!(handle.request_update());
         assert!(rx.try_recv().is_ok());
-    }
-}
-
-pub fn start_tray(controller: AppController) -> TrayHandle {
-    #[cfg(all(target_os = "linux", feature = "tray"))]
-    {
-        linux::start_tray(controller)
-    }
-
-    #[cfg(all(target_os = "windows", feature = "tray"))]
-    {
-        windows::start_tray(controller)
-    }
-
-    #[cfg(not(any(
-        all(target_os = "linux", feature = "tray"),
-        all(target_os = "windows", feature = "tray")
-    )))]
-    {
-        mock::start_tray(controller)
     }
 }
