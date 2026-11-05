@@ -27,7 +27,7 @@ pub struct DisplayState {
     pub info: DisplayInfo,
     pub pending: bool,
     pub error: Option<String>,
-    pending_request_id: u64,
+    latest_request_id: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -47,6 +47,7 @@ enum BrightnessCommand {
     Adjust {
         display_id: DisplayId,
         delta: i32,
+        request_id: u64,
     },
     Shutdown,
 }
@@ -159,10 +160,15 @@ impl AppController {
                 apply_step(current, delta, self.inner.config.normalized_step()),
             );
         } else {
-            let _ = self
-                .inner
-                .brightness_tx
-                .send(BrightnessCommand::Adjust { display_id, delta });
+            let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+            begin_brightness_update(&self.inner.snapshot, &display_id, request_id);
+            notify_state_changed(&self.inner.state_tx);
+            self.request_repaint();
+            let _ = self.inner.brightness_tx.send(BrightnessCommand::Adjust {
+                display_id,
+                delta,
+                request_id,
+            });
         }
     }
 
@@ -401,9 +407,18 @@ fn spawn_brightness_worker(
                     value,
                     request_id,
                 ),
-                BrightnessCommand::Adjust { display_id, delta } => {
-                    adjust_display_brightness(backend.as_ref(), &snapshot, &display_id, delta, step)
-                }
+                BrightnessCommand::Adjust {
+                    display_id,
+                    delta,
+                    request_id,
+                } => adjust_display_brightness(
+                    backend.as_ref(),
+                    &snapshot,
+                    &display_id,
+                    delta,
+                    step,
+                    request_id,
+                ),
                 BrightnessCommand::Shutdown => break,
             }
             notify_state_changed(&state_tx);
@@ -443,26 +458,24 @@ fn refresh_snapshot(backend: &dyn BrightnessBackend, snapshot: &Arc<Mutex<AppSna
 
     match result {
         Ok(displays) => {
-            let previous_errors = snapshot
-                .displays
-                .iter()
-                .filter_map(|display| {
-                    display
-                        .error
-                        .as_ref()
-                        .map(|error| (display.info.id.clone(), error.clone()))
-                })
+            let previous_displays = std::mem::take(&mut snapshot.displays)
+                .into_iter()
+                .map(|display| (display.info.id.clone(), display))
                 .collect::<HashMap<_, _>>();
 
             snapshot.displays = displays
                 .into_iter()
-                .map(|info| {
-                    let error = previous_errors.get(&info.id).cloned();
+                .map(|mut info| {
+                    let previous = previous_displays.get(&info.id);
+                    let pending = previous.is_some_and(|display| display.pending);
+                    if pending {
+                        info.current = previous.and_then(|display| display.info.current);
+                    }
                     DisplayState {
                         info,
-                        pending: false,
-                        error,
-                        pending_request_id: 0,
+                        pending,
+                        error: previous.and_then(|display| display.error.clone()),
+                        latest_request_id: previous.map_or(0, |display| display.latest_request_id),
                     }
                 })
                 .collect();
@@ -484,7 +497,11 @@ fn set_display_brightness(
     value: u32,
     request_id: u64,
 ) {
-    mark_pending(snapshot, display_id, true, None);
+    // Dragging can enqueue values faster than the hardware can apply them.
+    // Only the latest request for each display needs a hardware write.
+    if !begin_brightness_update(snapshot, display_id, request_id) {
+        return;
+    }
     let result = backend
         .set_brightness(display_id, value)
         .and_then(|_| backend.get_brightness(display_id));
@@ -497,7 +514,11 @@ fn adjust_display_brightness(
     display_id: &DisplayId,
     delta: i32,
     step: u32,
+    request_id: u64,
 ) {
+    if !begin_brightness_update(snapshot, display_id, request_id) {
+        return;
+    }
     let current = snapshot
         .lock()
         .ok()
@@ -518,21 +539,20 @@ fn adjust_display_brightness(
     match current {
         Ok(current) => {
             let value = apply_step(current, delta, step);
-            update_pending_brightness(snapshot, display_id, value, 0);
-            set_display_brightness(backend, snapshot, display_id, value, 0);
+            update_pending_brightness(snapshot, display_id, value, request_id);
+            set_display_brightness(backend, snapshot, display_id, value, request_id);
         }
-        Err(error) => apply_brightness_result(snapshot, display_id, Err(error), 0),
+        Err(error) => apply_brightness_result(snapshot, display_id, Err(error), request_id),
     }
 }
 
-fn mark_pending(
+fn begin_brightness_update(
     snapshot: &Arc<Mutex<AppSnapshot>>,
     display_id: &DisplayId,
-    pending: bool,
-    error: Option<String>,
-) {
+    request_id: u64,
+) -> bool {
     let Ok(mut snapshot) = snapshot.lock() else {
-        return;
+        return false;
     };
 
     if let Some(display) = snapshot
@@ -540,9 +560,14 @@ fn mark_pending(
         .iter_mut()
         .find(|display| &display.info.id == display_id)
     {
-        display.pending = pending;
-        display.error = error;
+        if request_id < display.latest_request_id {
+            return false;
+        }
+        display.latest_request_id = request_id;
+        display.pending = true;
+        display.error = None;
     }
+    true
 }
 
 fn update_pending_brightness(
@@ -560,10 +585,13 @@ fn update_pending_brightness(
         .iter_mut()
         .find(|display| &display.info.id == display_id)
     {
+        if request_id < display.latest_request_id {
+            return;
+        }
         display.info.current = Some(clamp_percent(value));
         display.pending = true;
         display.error = None;
-        display.pending_request_id = request_id;
+        display.latest_request_id = request_id;
     }
 }
 
@@ -584,13 +612,12 @@ fn apply_brightness_result(
                 .iter_mut()
                 .find(|display| &display.info.id == display_id)
             {
-                if request_id < display.pending_request_id {
+                if request_id < display.latest_request_id {
                     return;
                 }
                 display.info.current = Some(value.percent());
                 display.pending = false;
                 display.error = None;
-                display.pending_request_id = 0;
             }
         }
         Err(error) => {
@@ -599,12 +626,11 @@ fn apply_brightness_result(
                 .iter_mut()
                 .find(|display| &display.info.id == display_id)
             {
-                if request_id < display.pending_request_id {
+                if request_id < display.latest_request_id {
                     return;
                 }
                 display.pending = false;
                 display.error = Some(error.to_string());
-                display.pending_request_id = 0;
             } else {
                 snapshot.last_error = Some(error.to_string());
             }
@@ -664,5 +690,206 @@ mod tests {
             true,
             Some("")
         ));
+    }
+
+    #[cfg(feature = "mock-backend")]
+    mod live_updates {
+        use super::*;
+        use crate::brightness::mock::MockBrightnessBackend;
+        use std::time::Instant;
+
+        struct BlockingBackend {
+            inner: MockBrightnessBackend,
+            writes: Sender<(DisplayId, u32)>,
+            resume: Mutex<Receiver<()>>,
+            block_next_write: AtomicBool,
+        }
+
+        impl BrightnessBackend for BlockingBackend {
+            fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
+                self.inner.list_displays()
+            }
+
+            fn get_brightness(&self, display_id: &DisplayId) -> Result<BrightnessValue> {
+                self.inner.get_brightness(display_id)
+            }
+
+            fn set_brightness(&self, display_id: &DisplayId, value: u32) -> Result<()> {
+                self.writes.send((display_id.clone(), value)).unwrap();
+                if self.block_next_write.swap(false, Ordering::Relaxed) {
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .expect("test did not release the hardware write");
+                }
+                self.inner.set_brightness(display_id, value)
+            }
+        }
+
+        fn wait_until_idle(controller: &AppController) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let snapshot = controller.snapshot();
+                if !snapshot.displays.is_empty()
+                    && snapshot.displays.iter().all(|display| !display.pending)
+                {
+                    return;
+                }
+                controller
+                    .inner
+                    .state_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("brightness worker did not finish");
+            }
+        }
+
+        #[test]
+        fn live_updates_write_immediately_and_skip_superseded_values_per_display() {
+            let (writes_tx, writes_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let backend = Arc::new(BlockingBackend {
+                inner: MockBrightnessBackend::default(),
+                writes: writes_tx,
+                resume: Mutex::new(resume_rx),
+                block_next_write: AtomicBool::new(true),
+            });
+            let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+            wait_until_idle(&controller);
+            let internal = DisplayId::new("mock:internal");
+            let external = DisplayId::new("mock:external");
+
+            // The first value reaches the hardware before the interaction ends.
+            controller.set_brightness(internal.clone(), 20);
+            assert_eq!(
+                writes_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                (internal.clone(), 20)
+            );
+            controller.set_brightness(internal.clone(), 30);
+            controller.set_brightness(internal.clone(), 40);
+            controller.set_brightness(external.clone(), 55);
+            controller.set_brightness(internal.clone(), 80);
+
+            resume_tx.send(()).unwrap();
+            assert_eq!(
+                writes_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                (external.clone(), 55)
+            );
+            assert_eq!(
+                writes_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                (internal.clone(), 80)
+            );
+            wait_until_idle(&controller);
+            assert!(writes_rx.try_recv().is_err());
+            assert_eq!(backend.get_brightness(&internal).unwrap().percent(), 80);
+            assert_eq!(backend.get_brightness(&external).unwrap().percent(), 55);
+            controller.shutdown();
+        }
+
+        #[test]
+        fn completed_update_rejects_late_older_commits() {
+            let backend = MockBrightnessBackend::default();
+            let snapshot = Arc::new(Mutex::new(AppSnapshot::default()));
+            refresh_snapshot(&backend, &snapshot);
+            let display_id = DisplayId::new("mock:internal");
+            update_pending_brightness(&snapshot, &display_id, 80, 2);
+            set_display_brightness(&backend, &snapshot, &display_id, 80, 2);
+
+            set_display_brightness(&backend, &snapshot, &display_id, 20, 1);
+            update_pending_brightness(&snapshot, &display_id, 20, 1);
+            assert_eq!(backend.get_brightness(&display_id).unwrap().percent(), 80);
+            let snapshot = snapshot.lock().unwrap();
+            let display = &snapshot.displays[0];
+            assert_eq!(display.info.current, Some(80));
+            assert!(!display.pending);
+            assert_eq!(display.latest_request_id, 2);
+        }
+
+        #[test]
+        fn adjustment_without_cached_value_uses_a_new_request_id() {
+            let backend = Arc::new(MockBrightnessBackend::default());
+            let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+            wait_until_idle(&controller);
+            let display_id = DisplayId::new("mock:internal");
+
+            for expected in [65, 70] {
+                controller.inner.snapshot.lock().unwrap().displays[0]
+                    .info
+                    .current = None;
+                controller.adjust_brightness(display_id.clone(), 1);
+                wait_until_idle(&controller);
+                assert_eq!(
+                    backend.get_brightness(&display_id).unwrap().percent(),
+                    expected
+                );
+                assert_eq!(
+                    controller.snapshot().displays[0].info.current,
+                    Some(expected)
+                );
+            }
+            controller.shutdown();
+        }
+
+        #[test]
+        fn stale_readbacks_and_errors_do_not_replace_latest_preview() {
+            let backend = MockBrightnessBackend::default();
+            let snapshot = Arc::new(Mutex::new(AppSnapshot::default()));
+            refresh_snapshot(&backend, &snapshot);
+            let display_id = DisplayId::new("mock:internal");
+            update_pending_brightness(&snapshot, &display_id, 20, 1);
+            update_pending_brightness(&snapshot, &display_id, 80, 2);
+            apply_brightness_result(
+                &snapshot,
+                &display_id,
+                Ok(BrightnessValue {
+                    current: 20,
+                    max: 100,
+                }),
+                1,
+            );
+            apply_brightness_result(&snapshot, &display_id, Err(BrightnessError::Unsupported), 1);
+            {
+                let snapshot = snapshot.lock().unwrap();
+                let display = &snapshot.displays[0];
+                assert_eq!(display.info.current, Some(80));
+                assert!(display.pending);
+                assert!(display.error.is_none());
+            }
+
+            apply_brightness_result(&snapshot, &display_id, Err(BrightnessError::Unsupported), 2);
+            let snapshot = snapshot.lock().unwrap();
+            let display = &snapshot.displays[0];
+            assert!(!display.pending);
+            assert!(display.error.is_some());
+            assert_eq!(display.info.current, Some(80));
+        }
+
+        #[test]
+        fn refresh_preserves_pending_value_and_latest_request_id() {
+            let backend = MockBrightnessBackend::default();
+            let snapshot = Arc::new(Mutex::new(AppSnapshot::default()));
+            refresh_snapshot(&backend, &snapshot);
+            let display_id = DisplayId::new("mock:internal");
+            update_pending_brightness(&snapshot, &display_id, 80, 2);
+
+            refresh_snapshot(&backend, &snapshot);
+            {
+                let snapshot = snapshot.lock().unwrap();
+                let display = &snapshot.displays[0];
+                assert_eq!(display.info.current, Some(80));
+                assert!(display.pending);
+                assert_eq!(display.latest_request_id, 2);
+            }
+
+            set_display_brightness(&backend, &snapshot, &display_id, 80, 2);
+            refresh_snapshot(&backend, &snapshot);
+            let snapshot = snapshot.lock().unwrap();
+            let display = &snapshot.displays[0];
+            assert_eq!(display.info.current, Some(80));
+            assert!(!display.pending);
+            assert_eq!(display.latest_request_id, 2);
+        }
     }
 }
