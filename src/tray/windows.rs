@@ -28,6 +28,7 @@ use windows_sys::Win32::{
 use crate::{
     app::{AppController, DisplayState},
     brightness::DisplayId,
+    profiles::ProfileSlot,
 };
 
 use super::TrayHandle;
@@ -41,6 +42,8 @@ const WM_TRAY_OPEN_WINDOW: u32 = WM_APP + 4;
 const CMD_OPEN: u32 = 100;
 const CMD_REFRESH: u32 = 101;
 const CMD_QUIT: u32 = 102;
+const CMD_BRIGHT: u32 = 103;
+const CMD_DARK: u32 = 104;
 const CMD_DYNAMIC_START: u32 = 1000;
 const ICON_RESOURCE_VERSION: u32 = 0x0003_0000;
 const TRAY_ICON_SIZE: u16 = 32;
@@ -61,6 +64,7 @@ enum TrayCommand {
     Quit,
     Adjust(DisplayId, i32),
     Set(DisplayId, u32),
+    ApplyProfile(ProfileSlot),
 }
 
 pub fn start_tray(controller: AppController) -> TrayHandle {
@@ -239,7 +243,27 @@ impl WindowsTray {
         commands.insert(CMD_REFRESH, TrayCommand::Refresh);
         append_separator(menu.handle);
 
+        for (command_id, slot) in [
+            (CMD_BRIGHT, ProfileSlot::Bright),
+            (CMD_DARK, ProfileSlot::Dark),
+        ] {
+            append_command(
+                menu.handle,
+                command_id,
+                &format!("{} Profile\t{}", slot.label(), slot.shortcut()),
+                self.controller.can_apply_profile(slot),
+            );
+            commands.insert(command_id, TrayCommand::ApplyProfile(slot));
+        }
+        append_separator(menu.handle);
+
         let snapshot = self.controller.snapshot();
+        for error in [&snapshot.profile_error, &snapshot.hotkey_error]
+            .into_iter()
+            .flatten()
+        {
+            append_command(menu.handle, 0, error, false);
+        }
         if let Some(error) = snapshot.last_error {
             append_command(menu.handle, 0, &error, false);
             append_separator(menu.handle);
@@ -332,6 +356,7 @@ impl WindowsTray {
         match command {
             TrayCommand::Open => self.controller.request_open_window(),
             TrayCommand::Refresh => self.controller.refresh(),
+            TrayCommand::ApplyProfile(slot) => self.controller.apply_profile(slot),
             TrayCommand::Quit => self.controller.request_quit(),
             TrayCommand::Adjust(display_id, delta) => {
                 self.controller.adjust_brightness(display_id, delta)

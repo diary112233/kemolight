@@ -5,6 +5,7 @@ use eframe::egui::{self, RichText, Slider, ViewportCommand};
 use crate::{
     app::{AppCommand, AppController, DisplayState},
     brightness::DisplayId,
+    profiles::ProfileSlot,
 };
 
 const PENDING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
@@ -101,6 +102,51 @@ impl MainWindow {
                 self.controller.refresh();
                 ui.ctx().request_repaint();
             }
+
+            ui.menu_button("Profiles", |ui| {
+                let snapshot = self.controller.snapshot();
+                ui.set_min_width(270.0);
+                for slot in ProfileSlot::ALL {
+                    ui.strong(slot.label());
+                    let saved = snapshot.profiles.get(slot);
+                    if saved.is_empty() {
+                        ui.weak("No brightness saved yet");
+                    } else {
+                        for entry in saved.values() {
+                            ui.label(format!("{}: {}%", entry.name, entry.brightness));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.controller.can_save_profile(),
+                                egui::Button::new("Save current"),
+                            )
+                            .clicked()
+                        {
+                            self.controller.save_profile(slot);
+                            ui.close();
+                        }
+                        let label = if cfg!(target_os = "windows") {
+                            format!("Apply ({})", slot.shortcut())
+                        } else {
+                            "Apply".into()
+                        };
+                        if ui
+                            .add_enabled(
+                                self.controller.can_apply_profile(slot),
+                                egui::Button::new(label),
+                            )
+                            .clicked()
+                        {
+                            self.controller.apply_profile(slot);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                }
+                ui.weak("Saves each connected display separately.");
+            });
 
             let hide_label = if self.controller.tray_available() {
                 "Hide to Tray"
@@ -229,6 +275,15 @@ impl eframe::App for MainWindow {
             ui.separator();
 
             let snapshot = self.controller.snapshot();
+            if let Some(message) = &snapshot.profile_message {
+                ui.small(message);
+            }
+            for error in [&snapshot.profile_error, &snapshot.hotkey_error]
+                .into_iter()
+                .flatten()
+            {
+                ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
+            }
             if let Some(error) = snapshot.last_error {
                 ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
                 ui.separator();

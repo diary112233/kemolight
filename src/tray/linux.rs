@@ -11,6 +11,7 @@ use crate::{
     app::{AppController, DisplayState},
     brightness::DisplayId,
     logo,
+    profiles::ProfileSlot,
 };
 
 use super::TrayHandle;
@@ -145,6 +146,30 @@ impl ksni::Tray for BrightnessTray {
             .into(),
             MenuItem::Separator,
         ];
+
+        for slot in ProfileSlot::ALL {
+            items.push(
+                StandardItem {
+                    label: format!("{} Profile", slot.label()),
+                    enabled: self.controller.can_apply_profile(slot),
+                    activate: Box::new(move |this: &mut Self| this.controller.apply_profile(slot)),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        items.push(MenuItem::Separator);
+
+        if let Some(error) = &snapshot.profile_error {
+            items.push(
+                StandardItem {
+                    label: error.clone(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         if let Some(error) = snapshot.last_error {
             items.push(

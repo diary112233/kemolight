@@ -54,8 +54,19 @@ Log out and back in after changing groups. If `ddcutil detect` reports permissio
 - Display changes (plug/unplug, desktop configuration, display power, and resume) automatically refresh the main window and tray list. Notifications are coalesced, with a second refresh after drivers settle; this also works without a tray icon.
 - External monitors: Windows Monitor Configuration API over DDC/CI.
 - Only monitors that report brightness support through Windows DDC/CI APIs are enabled. Unsupported monitors are listed but their controls are disabled.
+- Global shortcuts: **Shift+Win+B** applies the Bright profile; **Shift+Win+D** applies the Dark profile, including while hidden to the tray. A shortcut conflict is reported in the main window; tray and toolbar controls remain available.
 
 External monitors must have DDC/CI enabled in the monitor OSD. Some HDMI/DP adapters, docks, KVMs, GPU drivers, HDR modes, and vendor utilities can block or interfere with DDC/CI brightness commands.
+
+## Brightness Profiles
+
+1. Adjust each display to the brightness you want and wait for updates to finish.
+2. Open **Profiles** in the top toolbar and choose **Save current** under **Bright** or **Dark**.
+3. Use **Apply**, the tray's **Bright Profile / Dark Profile** entries, or the Windows global shortcuts to restore that profile.
+
+Each profile stores a separate brightness for each display in `profiles.toml`, alongside `config.toml`. Saves survive app restarts. Saving updates the currently available displays and preserves saved values for closed or disconnected screens; applying skips screens that are currently hidden, unavailable, unsupported, or have no saved value. Opening/reconnecting a screen restores its list entry; apply a profile again to set its saved brightness.
+
+Windows profiles match the WMI instance or monitor device interface rather than the display's enumeration number. Displays without a stable Windows device identity remain manually controllable and are excluded from profiles. Connecting a display through a different port or dock can change its Windows identity and require saving it again.
 
 ## Run
 

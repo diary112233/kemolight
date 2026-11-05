@@ -14,26 +14,75 @@ use windows_sys::Win32::{
         },
         SystemServices::{GUID_CONSOLE_DISPLAY_STATE, GUID_LIDSWITCH_STATE_CHANGE},
     },
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterDeviceNotificationW, SetTimer, SetWindowLongPtrW, TranslateMessage,
-        UnregisterDeviceNotification, CREATESTRUCTW, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE,
-        DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
-        DEV_BROADCAST_DEVICEINTERFACE_W, GWLP_USERDATA, HDEVNOTIFY, MSG, PBT_APMRESUMEAUTOMATIC,
-        PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, WM_APP, WM_DESTROY, WM_DEVICECHANGE,
-        WM_DISPLAYCHANGE, WM_NCCREATE, WM_NCDESTROY, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW,
-        WS_OVERLAPPED,
+    UI::{
+        Input::KeyboardAndMouse::{
+            RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+        },
+        WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+            GetWindowLongPtrW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW,
+            RegisterDeviceNotificationW, SetTimer, SetWindowLongPtrW, TranslateMessage,
+            UnregisterDeviceNotification, CREATESTRUCTW, DBT_DEVICEARRIVAL,
+            DBT_DEVICEREMOVECOMPLETE, DBT_DEVNODES_CHANGED, DBT_DEVTYP_DEVICEINTERFACE,
+            DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W, GWLP_USERDATA,
+            HDEVNOTIFY, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE,
+            WM_APP, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCCREATE,
+            WM_NCDESTROY, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+        },
     },
 };
 
-use crate::app::AppController;
+use crate::{app::AppController, profiles::ProfileSlot};
 
 const WM_STOP: u32 = WM_APP + 1;
 const REFRESH_TIMER: usize = 1;
 const SETTLED_REFRESH_TIMER: usize = 2;
 const REFRESH_DELAY_MS: u32 = 300;
 const SETTLED_REFRESH_DELAY_MS: u32 = 2000;
+const HOTKEY_BRIGHT: i32 = 1;
+const HOTKEY_DARK: i32 = 2;
+
+struct Hotkeys {
+    hwnd: HWND,
+    registered: Vec<i32>,
+}
+
+impl Hotkeys {
+    fn register(hwnd: HWND, controller: &AppController) -> Self {
+        let mut hotkeys = Self {
+            hwnd,
+            registered: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        for (id, key, slot) in [
+            (HOTKEY_BRIGHT, b'B', ProfileSlot::Bright),
+            (HOTKEY_DARK, b'D', ProfileSlot::Dark),
+        ] {
+            if unsafe {
+                RegisterHotKey(hwnd, id, MOD_SHIFT | MOD_WIN | MOD_NOREPEAT, u32::from(key))
+            } != 0
+            {
+                hotkeys.registered.push(id);
+            } else {
+                errors.push(format!(
+                    "{} unavailable: {}",
+                    slot.shortcut(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        controller.set_hotkey_error((!errors.is_empty()).then(|| errors.join("; ")));
+        hotkeys
+    }
+}
+
+impl Drop for Hotkeys {
+    fn drop(&mut self) {
+        for id in &self.registered {
+            unsafe { UnregisterHotKey(self.hwnd, *id) };
+        }
+    }
+}
 
 pub(crate) struct DisplayWatcher {
     hwnd: isize,
@@ -178,6 +227,7 @@ fn run(
         return Err(error);
     }
 
+    let _hotkeys = Hotkeys::register(hwnd, &controller);
     let _ = ready_tx.send(Ok(hwnd as isize));
     let mut message = MSG::default();
     loop {
@@ -315,6 +365,36 @@ mod tests {
         send_lid(hwnd, 1);
         wait_for(|| controller.snapshot().displays.len() == 2);
 
+        eprintln!(
+            "Global hotkey registration: {:?}",
+            controller.snapshot().hotkey_error
+        );
+        controller.save_profile(ProfileSlot::Bright);
+        wait_for(|| controller.can_apply_profile(ProfileSlot::Bright));
+        let internal = crate::brightness::DisplayId::new("mock:internal");
+        let external = crate::brightness::DisplayId::new("mock:external");
+        controller.set_brightness(internal.clone(), 15);
+        controller.set_brightness(external.clone(), 25);
+        wait_for(|| {
+            controller
+                .snapshot()
+                .displays
+                .iter()
+                .all(|display| !display.pending)
+        });
+        controller.save_profile(ProfileSlot::Dark);
+        wait_for(|| controller.can_apply_profile(ProfileSlot::Dark));
+        unsafe { PostMessageW(hwnd, WM_HOTKEY, HOTKEY_BRIGHT as usize, 0) };
+        wait_for(|| {
+            backend.get_brightness(&internal).unwrap().percent() == 60
+                && backend.get_brightness(&external).unwrap().percent() == 70
+        });
+        unsafe { PostMessageW(hwnd, WM_HOTKEY, HOTKEY_DARK as usize, 0) };
+        wait_for(|| {
+            backend.get_brightness(&internal).unwrap().percent() == 15
+                && backend.get_brightness(&external).unwrap().percent() == 25
+        });
+
         backend.external_connected.store(false, Ordering::SeqCst);
         unsafe { PostMessageW(hwnd, WM_DISPLAYCHANGE, 0, 0) };
         wait_for(|| controller.snapshot().displays.len() == 1);
@@ -370,6 +450,16 @@ unsafe extern "system" fn window_proc(
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     match message {
+        WM_HOTKEY => {
+            if !(*controller).is_quitting() {
+                match wparam as i32 {
+                    HOTKEY_BRIGHT => (*controller).apply_profile(ProfileSlot::Bright),
+                    HOTKEY_DARK => (*controller).apply_profile(ProfileSlot::Dark),
+                    _ => {}
+                }
+            }
+            0
+        }
         WM_DISPLAYCHANGE => {
             schedule_refresh(hwnd);
             0
