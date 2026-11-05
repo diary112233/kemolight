@@ -13,7 +13,7 @@ use eframe::egui;
 use crate::{
     brightness::{
         apply_step, clamp_percent, create_backend, BrightnessBackend, BrightnessValue, DisplayId,
-        DisplayInfo, Result,
+        DisplayInfo, DisplayKind, Result,
     },
     config::AppConfig,
     tray, ui,
@@ -34,6 +34,7 @@ pub struct DisplayState {
 pub struct AppSnapshot {
     pub displays: Vec<DisplayState>,
     pub last_error: Option<String>,
+    lid_closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,11 +141,27 @@ impl AppController {
             .unwrap_or_else(|_| AppSnapshot {
                 displays: Vec::new(),
                 last_error: Some("application state lock was poisoned".to_string()),
+                ..Default::default()
             })
     }
 
     pub fn refresh(&self) {
         let _ = self.inner.brightness_tx.send(BrightnessCommand::Refresh);
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn set_lid_closed(&self, closed: bool) {
+        if let Ok(mut snapshot) = self.inner.snapshot.lock() {
+            snapshot.lid_closed = closed;
+            if closed {
+                snapshot
+                    .displays
+                    .retain(|display| display.info.kind != DisplayKind::InternalBacklight);
+            }
+        }
+        notify_state_changed(&self.inner.state_tx);
+        self.request_repaint();
+        self.request_tray_update();
     }
 
     pub fn set_brightness(&self, display_id: DisplayId, value: u32) {
@@ -283,6 +300,12 @@ pub fn run() {
     });
     // The brightness worker performs initial discovery before processing commands.
     let controller = AppController::new(config);
+
+    // A separate hidden window receives broadcasts even without a tray icon.
+    #[cfg(target_os = "windows")]
+    let _display_watcher = crate::display_events::DisplayWatcher::start(controller.clone())
+        .map_err(|err| eprintln!("Display change notifications unavailable: {err}"))
+        .ok();
 
     let tray_handle = tray::start_tray(controller.clone());
     controller.set_tray_available(tray_handle.is_available());
@@ -465,6 +488,9 @@ fn refresh_snapshot(backend: &dyn BrightnessBackend, snapshot: &Arc<Mutex<AppSna
 
             snapshot.displays = displays
                 .into_iter()
+                // Read the latest lid state after discovery: a close notification
+                // may arrive while the worker is blocked in WMI or DDC/CI.
+                .filter(|info| !snapshot.lid_closed || info.kind != DisplayKind::InternalBacklight)
                 .map(|mut info| {
                     let previous = previous_displays.get(&info.id);
                     let pending = previous.is_some_and(|display| display.pending);
@@ -555,18 +581,20 @@ fn begin_brightness_update(
         return false;
     };
 
-    if let Some(display) = snapshot
+    let Some(display) = snapshot
         .displays
         .iter_mut()
         .find(|display| &display.info.id == display_id)
-    {
-        if request_id < display.latest_request_id {
-            return false;
-        }
-        display.latest_request_id = request_id;
-        display.pending = true;
-        display.error = None;
+    else {
+        // A queued slider/menu action must not write to a hidden or removed screen.
+        return false;
+    };
+    if request_id < display.latest_request_id {
+        return false;
     }
+    display.latest_request_id = request_id;
+    display.pending = true;
+    display.error = None;
     true
 }
 
@@ -744,6 +772,78 @@ mod tests {
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .expect("brightness worker did not finish");
             }
+        }
+
+        #[test]
+        fn closing_lid_during_discovery_hides_internal_and_opening_restores_it() {
+            struct GatedDiscovery {
+                inner: MockBrightnessBackend,
+                started: Sender<()>,
+                resume: Mutex<Receiver<()>>,
+                block: AtomicBool,
+            }
+            impl BrightnessBackend for GatedDiscovery {
+                fn list_displays(&self) -> Result<Vec<DisplayInfo>> {
+                    let displays = self.inner.list_displays()?;
+                    if self.block.swap(false, Ordering::SeqCst) {
+                        self.started.send(()).unwrap();
+                        self.resume
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(3))
+                            .unwrap();
+                    }
+                    Ok(displays)
+                }
+                fn get_brightness(&self, id: &DisplayId) -> Result<BrightnessValue> {
+                    self.inner.get_brightness(id)
+                }
+                fn set_brightness(&self, id: &DisplayId, value: u32) -> Result<()> {
+                    self.inner.set_brightness(id, value)
+                }
+            }
+
+            let (started_tx, started_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let backend = Arc::new(GatedDiscovery {
+                inner: MockBrightnessBackend::default(),
+                started: started_tx,
+                resume: Mutex::new(resume_rx),
+                block: AtomicBool::new(true),
+            });
+            let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+            started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            controller.set_lid_closed(true);
+            resume_tx.send(()).unwrap();
+            wait_until_idle(&controller);
+            assert_eq!(controller.snapshot().displays.len(), 1);
+            assert_eq!(
+                controller.snapshot().displays[0].info.kind,
+                DisplayKind::ExternalDdcCi
+            );
+
+            // Refreshing while closed cannot reintroduce the WMI panel.
+            refresh_snapshot(backend.as_ref(), &controller.inner.snapshot);
+            assert_eq!(controller.snapshot().displays.len(), 1);
+
+            controller.set_lid_closed(false);
+            refresh_snapshot(backend.as_ref(), &controller.inner.snapshot);
+            assert_eq!(controller.snapshot().displays.len(), 2);
+
+            // Close removes an already visible panel immediately. An action
+            // queued before the close must not change its hardware brightness.
+            let internal = DisplayId::new("mock:internal");
+            controller.set_lid_closed(true);
+            assert_eq!(controller.snapshot().displays.len(), 1);
+            set_display_brightness(
+                backend.as_ref(),
+                &controller.inner.snapshot,
+                &internal,
+                20,
+                1,
+            );
+            assert_eq!(backend.get_brightness(&internal).unwrap().percent(), 60);
+            controller.shutdown();
         }
 
         #[test]

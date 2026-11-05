@@ -50,6 +50,8 @@ Log out and back in after changing groups. If `ddcutil detect` reports permissio
 - System tray: native Windows notification area icon using `Shell_NotifyIconW`.
 - Tray menu: open window, refresh displays, set brightness presets, adjust brightness, and quit.
 - Internal laptop panels: Windows WMI/CIM brightness APIs.
+- The internal panel is hidden while the laptop lid is closed and restored after it opens, including when the app starts with the lid closed.
+- Display changes (plug/unplug, desktop configuration, display power, and resume) automatically refresh the main window and tray list. Notifications are coalesced, with a second refresh after drivers settle; this also works without a tray icon.
 - External monitors: Windows Monitor Configuration API over DDC/CI.
 - Only monitors that report brightness support through Windows DDC/CI APIs are enabled. Unsupported monitors are listed but their controls are disabled.
 
