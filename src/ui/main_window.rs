@@ -38,40 +38,53 @@ impl MainWindow {
         if self.quitting || !self.controller.tray_available() {
             self.quit(ctx);
         } else {
-            self.hide_to_tray(ctx, true);
+            self.hide_to_tray(ctx);
         }
     }
 
     fn handle_app_commands(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            return;
+        }
         for command in self.controller.drain_app_commands() {
             match command {
                 AppCommand::OpenWindow => self.show_window(ctx),
-                AppCommand::HideWindow => self.hide_to_tray(ctx, false),
+                AppCommand::HideWindow => self.hide_to_tray(ctx),
                 AppCommand::Quit => self.quit(ctx),
+                #[cfg(target_os = "windows")]
+                AppCommand::UiClosed(_) => {}
+            }
+            if self.quitting {
+                break;
             }
         }
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        if !self.visible {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
         self.visible = true;
+        #[cfg(target_os = "windows")]
+        self.controller.window_shown();
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.request_repaint();
     }
 
-    fn hide_to_tray(&mut self, ctx: &egui::Context, cancel_close: bool) {
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if !self.controller.tray_available() {
             self.quit(ctx);
             return;
         }
 
         self.visible = false;
+        self.controller.remember_window_geometry(ctx);
 
-        if cancel_close {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        }
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        // Return from run_native so the window, renderer, and egui caches can
+        // be dropped. The tray session recreates the UI when it is opened.
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -155,7 +168,7 @@ impl MainWindow {
             };
             if ui.button(hide_label).clicked() {
                 if self.controller.tray_available() {
-                    self.hide_to_tray(ui.ctx(), false);
+                    self.hide_to_tray(ui.ctx());
                 } else {
                     self.quit(ui.ctx());
                 }
@@ -323,6 +336,55 @@ mod tests {
             assert!(Instant::now() < deadline, "brightness update timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn hide_releases_viewport_and_keeps_brightness_control_running() {
+        let backend = Arc::new(MockBrightnessBackend::default());
+        let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+        controller.set_tray_available(true);
+        wait_for(|| !controller.snapshot().displays.is_empty());
+        let mut window = MainWindow::new(controller.clone(), true);
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.hide_to_tray(ui.ctx());
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::Close)));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose)));
+        assert!(!controller.is_quitting());
+
+        let display_id = DisplayId::new("mock:internal");
+        controller.set_brightness(display_id.clone(), 42);
+        wait_for(|| backend.get_brightness(&display_id).unwrap().percent() == 42);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn open_cancels_a_hide_requested_in_the_same_frame() {
+        let controller = AppController::with_backend(
+            AppConfig::default(),
+            Arc::new(MockBrightnessBackend::default()),
+        );
+        controller.set_tray_available(true);
+        let mut window = MainWindow::new(controller.clone(), true);
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.hide_to_tray(ui.ctx());
+            controller.request_open_window();
+            window.handle_app_commands(ui.ctx());
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose)));
+        assert!(window.visible);
+        assert!(!controller.is_quitting());
+        controller.shutdown();
     }
 
     #[test]

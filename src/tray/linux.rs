@@ -220,10 +220,10 @@ pub fn start_tray(controller: AppController) -> TrayHandle {
     let tray = BrightnessTray { controller };
     match tray.spawn() {
         Ok(handle) => {
-            let (update_tx, update_rx) = mpsc::channel();
+            let (update_tx, update_rx) = mpsc::sync_channel(1);
             spawn_tray_updater(update_rx, handle.clone());
 
-            TrayHandle::available(update_tx, move || {
+            TrayHandle::available(Some(update_tx), move || {
                 handle.shutdown().wait();
             })
         }

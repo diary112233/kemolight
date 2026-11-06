@@ -2,13 +2,14 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex,
     },
     thread,
 };
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     brightness::{
@@ -23,7 +24,7 @@ use crate::{
 const APP_TITLE: &str = "Brightness Controller";
 const APP_ID: &str = "dev.kemolight.BrightnessController";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayState {
     pub info: DisplayInfo,
     pub pending: bool,
@@ -31,7 +32,7 @@ pub struct DisplayState {
     latest_request_id: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub displays: Vec<DisplayState>,
     pub last_error: Option<String>,
@@ -39,7 +40,7 @@ pub struct AppSnapshot {
     pub profile_message: Option<String>,
     pub profile_error: Option<String>,
     pub hotkey_error: Option<String>,
-    lid_closed: bool,
+    pub(crate) lid_closed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,8 @@ pub enum AppCommand {
     OpenWindow,
     HideWindow,
     Quit,
+    #[cfg(target_os = "windows")]
+    UiClosed(u64),
 }
 
 #[derive(Clone)]
@@ -79,16 +82,25 @@ struct AppControllerInner {
     config: AppConfig,
     snapshot: Arc<Mutex<AppSnapshot>>,
     brightness_tx: Sender<BrightnessCommand>,
-    state_tx: Sender<()>,
+    state_tx: SyncSender<()>,
     state_rx: Mutex<Receiver<()>>,
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
-    tray_update_tx: Arc<Mutex<Option<Sender<()>>>>,
+    tray_update_tx: Arc<Mutex<Option<SyncSender<()>>>>,
     app_tx: Sender<AppCommand>,
     app_rx: Mutex<Receiver<AppCommand>>,
     tray_available: AtomicBool,
     is_quitting: AtomicBool,
     next_request_id: AtomicU64,
     profiles_path: Option<std::path::PathBuf>,
+    window_geometry: Mutex<WindowGeometry>,
+    #[cfg(target_os = "windows")]
+    remote: Option<crate::ui_process::RemoteClient>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct WindowGeometry {
+    pub(crate) inner_size: Option<[f32; 2]>,
+    pub(crate) outer_position: Option<[f32; 2]>,
 }
 
 impl AppController {
@@ -106,9 +118,6 @@ impl AppController {
         backend: Arc<dyn BrightnessBackend>,
         profiles_path: Option<std::path::PathBuf>,
     ) -> Self {
-        let (brightness_tx, brightness_rx) = mpsc::channel();
-        let (state_tx, state_rx) = mpsc::channel();
-        let (app_tx, app_rx) = mpsc::channel();
         let mut initial = AppSnapshot::default();
         if let Some(path) = &profiles_path {
             match BrightnessProfiles::load(path) {
@@ -116,37 +125,73 @@ impl AppController {
                 Err(error) => initial.profile_error = Some(error),
             }
         }
+        let (controller, brightness_rx) = Self::with_snapshot(config, initial, profiles_path);
+        let inner = &controller.inner;
+        spawn_brightness_worker(
+            backend,
+            Arc::clone(&inner.snapshot),
+            brightness_rx,
+            inner.state_tx.clone(),
+            Arc::clone(&inner.repaint_ctx),
+            Arc::clone(&inner.tray_update_tx),
+            inner.config.normalized_step(),
+        );
+        controller
+    }
+
+    fn with_snapshot(
+        config: AppConfig,
+        initial: AppSnapshot,
+        profiles_path: Option<std::path::PathBuf>,
+    ) -> (Self, Receiver<BrightnessCommand>) {
+        let (brightness_tx, brightness_rx) = mpsc::channel();
+        // These are wakeups, not state: one pending notification is sufficient.
+        let (state_tx, state_rx) = mpsc::sync_channel(1);
+        let (app_tx, app_rx) = mpsc::channel();
         let snapshot = Arc::new(Mutex::new(initial));
         let repaint_ctx = Arc::new(Mutex::new(None));
         let tray_update_tx = Arc::new(Mutex::new(None));
 
-        spawn_brightness_worker(
-            backend,
-            Arc::clone(&snapshot),
+        (
+            Self {
+                inner: Arc::new(AppControllerInner {
+                    config,
+                    snapshot,
+                    brightness_tx,
+                    state_tx,
+                    state_rx: Mutex::new(state_rx),
+                    repaint_ctx,
+                    tray_update_tx,
+                    app_tx,
+                    app_rx: Mutex::new(app_rx),
+                    tray_available: AtomicBool::new(false),
+                    is_quitting: AtomicBool::new(false),
+                    next_request_id: AtomicU64::new(1),
+                    profiles_path,
+                    window_geometry: Mutex::new(WindowGeometry::default()),
+                    #[cfg(target_os = "windows")]
+                    remote: None,
+                }),
+            },
             brightness_rx,
-            state_tx.clone(),
-            Arc::clone(&repaint_ctx),
-            Arc::clone(&tray_update_tx),
-            config.normalized_step(),
-        );
+        )
+    }
 
-        Self {
-            inner: Arc::new(AppControllerInner {
-                config,
-                snapshot,
-                brightness_tx,
-                state_tx,
-                state_rx: Mutex::new(state_rx),
-                repaint_ctx,
-                tray_update_tx,
-                app_tx,
-                app_rx: Mutex::new(app_rx),
-                tray_available: AtomicBool::new(false),
-                is_quitting: AtomicBool::new(false),
-                next_request_id: AtomicU64::new(1),
-                profiles_path,
-            }),
-        }
+    #[cfg(target_os = "windows")]
+    pub(crate) fn with_remote(
+        config: AppConfig,
+        snapshot: AppSnapshot,
+        geometry: WindowGeometry,
+        tray_available: bool,
+        remote: crate::ui_process::RemoteClient,
+    ) -> Self {
+        let (mut controller, _) = Self::with_snapshot(config, snapshot, None);
+        Arc::get_mut(&mut controller.inner)
+            .expect("new controller is unshared")
+            .remote = Some(remote);
+        controller.set_window_geometry(geometry);
+        controller.set_tray_available(tray_available);
+        controller
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -158,6 +203,75 @@ impl AppController {
             *repaint_ctx = Some(ctx.clone());
         }
         ctx.request_repaint();
+    }
+
+    pub(crate) fn clear_repaint_context(&self) {
+        if let Ok(mut repaint_ctx) = self.inner.repaint_ctx.lock() {
+            *repaint_ctx = None;
+        }
+    }
+
+    pub(crate) fn remember_window_geometry(&self, ctx: &egui::Context) {
+        if let Ok(mut geometry) = self.inner.window_geometry.lock() {
+            ctx.input(|input| {
+                let viewport = input.viewport();
+                geometry.inner_size = viewport.inner_rect.map(|rect| rect.size().into());
+                geometry.outer_position = viewport.outer_rect.map(|rect| rect.min.into());
+            });
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(
+                self,
+                crate::ui_process::UiCommand::Closing(self.window_geometry()),
+            );
+        }
+    }
+
+    pub(crate) fn window_geometry(&self) -> WindowGeometry {
+        self.inner
+            .window_geometry
+            .lock()
+            .map(|geometry| *geometry)
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_window_geometry(&self, geometry: WindowGeometry) {
+        if let Ok(mut current) = self.inner.window_geometry.lock() {
+            *current = geometry;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn window_shown(&self) {
+        if let Some(remote) = &self.inner.remote {
+            remote.send(self, crate::ui_process::UiCommand::Shown);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn replace_snapshot(&self, value: AppSnapshot) {
+        if let Ok(mut snapshot) = self.inner.snapshot.lock() {
+            *snapshot = value;
+        }
+        notify_state_changed(&self.inner.state_tx);
+        self.request_repaint();
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wait_for_state_event(&self) -> bool {
+        self.inner.state_rx.lock().is_ok_and(|rx| rx.recv().is_ok())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wait_for_app_command(&self) -> Option<AppCommand> {
+        self.inner.app_rx.lock().ok().and_then(|rx| rx.recv().ok())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn ui_closed(&self, session: u64) {
+        let _ = self.inner.app_tx.send(AppCommand::UiClosed(session));
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
@@ -173,6 +287,11 @@ impl AppController {
     }
 
     pub fn refresh(&self) {
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(self, crate::ui_process::UiCommand::Refresh);
+            return;
+        }
         let _ = self.inner.brightness_tx.send(BrightnessCommand::Refresh);
     }
 
@@ -198,6 +317,11 @@ impl AppController {
     }
 
     pub fn save_profile(&self, slot: ProfileSlot) {
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(self, crate::ui_process::UiCommand::SaveProfile(slot));
+            return;
+        }
         let snapshot = self.snapshot();
         if snapshot.displays.iter().any(|display| display.pending) {
             self.profile_feedback(
@@ -223,6 +347,11 @@ impl AppController {
     }
 
     pub fn apply_profile(&self, slot: ProfileSlot) {
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(self, crate::ui_process::UiCommand::ApplyProfile(slot));
+            return;
+        }
         let snapshot = self.snapshot();
         let displays: Vec<_> = snapshot
             .displays
@@ -286,6 +415,11 @@ impl AppController {
 
     pub fn set_brightness(&self, display_id: DisplayId, value: u32) {
         let value = clamp_percent(value);
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.set_brightness(self, display_id, value);
+            return;
+        }
         let request_id = self.preview_brightness(display_id.clone(), value);
         self.commit_brightness(display_id, value, request_id);
     }
@@ -297,6 +431,14 @@ impl AppController {
                 apply_step(current, delta, self.inner.config.normalized_step()),
             );
         } else {
+            #[cfg(target_os = "windows")]
+            if let Some(remote) = &self.inner.remote {
+                remote.send(
+                    self,
+                    crate::ui_process::UiCommand::Adjust { display_id, delta },
+                );
+                return;
+            }
             let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
             begin_brightness_update(&self.inner.snapshot, &display_id, request_id);
             notify_state_changed(&self.inner.state_tx);
@@ -323,6 +465,11 @@ impl AppController {
     }
 
     pub fn commit_brightness(&self, display_id: DisplayId, value: u32, request_id: u64) {
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.set_brightness(self, display_id, clamp_percent(value));
+            return;
+        }
         let _ = self.inner.brightness_tx.send(BrightnessCommand::Set {
             display_id,
             value: clamp_percent(value),
@@ -346,7 +493,14 @@ impl AppController {
     }
 
     pub fn shutdown(&self) {
-        self.inner.is_quitting.store(true, Ordering::Relaxed);
+        if self.inner.is_quitting.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(self, crate::ui_process::UiCommand::Quit);
+        }
+        notify_state_changed(&self.inner.state_tx);
         self.set_tray_update_sender(None);
         let _ = self.inner.brightness_tx.send(BrightnessCommand::Shutdown);
     }
@@ -365,7 +519,7 @@ impl AppController {
         self.inner.is_quitting.load(Ordering::Relaxed)
     }
 
-    fn set_tray_update_sender(&self, update_tx: Option<Sender<()>>) {
+    fn set_tray_update_sender(&self, update_tx: Option<SyncSender<()>>) {
         let Ok(mut current) = self.inner.tray_update_tx.lock() else {
             return;
         };
@@ -432,17 +586,23 @@ pub fn run() {
     controller.set_tray_update_sender(tray_handle.update_sender());
     controller.request_tray_update();
 
-    let start_visible = !controller.config().start_hidden || !controller.tray_available();
-    let prefer_x11 = should_prefer_x11_for_hide_to_tray(controller.tray_available());
-    let mut result = run_main_window(controller.clone(), start_visible, prefer_x11);
+    #[cfg(target_os = "windows")]
+    let result = crate::ui_process::run_sessions(&controller);
 
-    if result.is_err() && prefer_x11 {
-        eprintln!(
-            "Failed to start the X11/XWayland UI backend; falling back to the default backend. \
-             Hide to Tray may not hide the window on Wayland."
-        );
-        result = run_main_window(controller.clone(), start_visible, false);
-    }
+    #[cfg(not(target_os = "windows"))]
+    let result = {
+        let prefer_x11 = should_prefer_x11_for_hide_to_tray(controller.tray_available());
+        run_window_sessions(&controller, || {
+            let mut result = run_main_window(controller.clone(), prefer_x11);
+            if result.is_err() && prefer_x11 {
+                eprintln!(
+                "Failed to start the X11/XWayland UI backend; falling back to the default backend."
+            );
+                result = run_main_window(controller.clone(), false);
+            }
+            result
+        })
+    };
 
     if let Err(err) = result {
         eprintln!("Failed to run UI: {err}");
@@ -452,20 +612,57 @@ pub fn run() {
     drop(tray_handle);
 }
 
-fn run_main_window(
-    controller: AppController,
-    start_visible: bool,
-    prefer_x11: bool,
+#[cfg(any(not(target_os = "windows"), test))]
+fn run_window_sessions(
+    controller: &AppController,
+    mut show_window: impl FnMut() -> eframe::Result,
 ) -> eframe::Result {
+    let mut open = !controller.config().start_hidden || !controller.tray_available();
+    loop {
+        if open {
+            let result = show_window();
+            // The controller otherwise keeps egui's font atlas, layout caches,
+            // and repaint callback alive after the renderer has been destroyed.
+            controller.clear_repaint_context();
+            result?;
+        }
+        if controller.is_quitting() || !controller.tray_available() {
+            return Ok(());
+        }
+
+        // The tray and hardware workers run independently. Sleep without
+        // creating a window/graphics context or polling while hidden.
+        let command = controller
+            .inner
+            .app_rx
+            .lock()
+            .ok()
+            .and_then(|rx| rx.recv().ok());
+        match command {
+            Some(AppCommand::OpenWindow) => open = true,
+            Some(AppCommand::HideWindow) => open = false,
+            Some(AppCommand::Quit) | None => return Ok(()),
+            #[cfg(target_os = "windows")]
+            Some(AppCommand::UiClosed(_)) => open = false,
+        }
+    }
+}
+
+pub(crate) fn run_main_window(controller: AppController, prefer_x11: bool) -> eframe::Result {
+    let geometry = controller.window_geometry();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_TITLE)
+        .with_app_id(APP_ID)
+        .with_icon(crate::logo::app_icon(64))
+        .with_inner_size(geometry.inner_size.unwrap_or([560.0, 320.0]))
+        .with_min_inner_size([420.0, 240.0]);
+    if let Some(position) = geometry.outer_position {
+        viewport = viewport.with_position(position);
+    }
     let mut native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_TITLE)
-            .with_app_id(APP_ID)
-            .with_icon(crate::logo::app_icon(64))
-            .with_inner_size([560.0, 320.0])
-            .with_min_inner_size([420.0, 240.0])
-            .with_visible(start_visible),
-        centered: true,
+        viewport,
+        centered: geometry.outer_position.is_none(),
+        run_and_return: true,
         ..Default::default()
     };
     configure_linux_backend(&mut native_options, prefer_x11);
@@ -478,7 +675,7 @@ fn run_main_window(
             app_controller.set_repaint_context(creation_context.egui_ctx.clone());
             Ok(Box::new(ui::main_window::MainWindow::new(
                 app_controller.clone(),
-                start_visible,
+                true,
             )))
         }),
     )
@@ -498,7 +695,7 @@ fn should_prefer_x11_for_hide_to_tray_with_display(
     tray_available && display.is_some_and(|display| !display.is_empty())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn should_prefer_x11_for_hide_to_tray(_tray_available: bool) -> bool {
     false
 }
@@ -525,9 +722,9 @@ fn spawn_brightness_worker(
     backend: Arc<dyn BrightnessBackend>,
     snapshot: Arc<Mutex<AppSnapshot>>,
     rx: Receiver<BrightnessCommand>,
-    state_tx: Sender<()>,
+    state_tx: SyncSender<()>,
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
-    tray_update_tx: Arc<Mutex<Option<Sender<()>>>>,
+    tray_update_tx: Arc<Mutex<Option<SyncSender<()>>>>,
     step: u32,
 ) {
     thread::spawn(move || {
@@ -578,8 +775,8 @@ fn spawn_brightness_worker(
     });
 }
 
-fn notify_state_changed(state_tx: &Sender<()>) {
-    let _ = state_tx.send(());
+fn notify_state_changed(state_tx: &SyncSender<()>) {
+    let _ = state_tx.try_send(());
 }
 
 fn request_repaint(repaint_ctx: &Arc<Mutex<Option<egui::Context>>>) {
@@ -591,12 +788,12 @@ fn request_repaint(repaint_ctx: &Arc<Mutex<Option<egui::Context>>>) {
     }
 }
 
-fn notify_tray_changed(tray_update_tx: &Arc<Mutex<Option<Sender<()>>>>) {
+fn notify_tray_changed(tray_update_tx: &Arc<Mutex<Option<SyncSender<()>>>>) {
     let Ok(current) = tray_update_tx.lock() else {
         return;
     };
     if let Some(update_tx) = current.as_ref() {
-        let _ = update_tx.send(());
+        let _ = update_tx.try_send(());
     }
 }
 
@@ -833,6 +1030,96 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn state_notifications_stay_bounded_without_a_window() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        for _ in 0..10_000 {
+            notify_state_changed(&tx);
+        }
+        assert_eq!(rx.try_iter().count(), 1);
+        notify_state_changed(&tx);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    fn session_controller(start_hidden: bool, tray_available: bool) -> AppController {
+        let controller = AppController::with_backend(
+            AppConfig {
+                start_hidden,
+                ..Default::default()
+            },
+            Arc::new(UnsupportedBackend::new("test backend")),
+        );
+        controller.set_tray_available(tray_available);
+        controller
+    }
+
+    #[test]
+    fn tray_sessions_create_ui_only_on_open_and_release_context_on_close() {
+        let controller = session_controller(true, true);
+        controller.request_hide_window();
+        controller.request_open_window();
+        let mut sessions = 0;
+        run_window_sessions(&controller, || {
+            assert!(controller.inner.repaint_ctx.lock().unwrap().is_none());
+            sessions += 1;
+            controller.set_repaint_context(egui::Context::default());
+            if sessions == 1 {
+                controller.request_open_window();
+            } else {
+                controller.request_quit();
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sessions, 2);
+        assert!(controller.inner.repaint_ctx.lock().unwrap().is_none());
+        controller.shutdown();
+    }
+
+    #[test]
+    fn hidden_start_without_tray_still_opens_a_window() {
+        let controller = session_controller(true, false);
+        let mut sessions = 0;
+        run_window_sessions(&controller, || {
+            sessions += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sessions, 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn tray_can_quit_without_creating_ui() {
+        let controller = session_controller(true, true);
+        controller.request_quit();
+        run_window_sessions(&controller, || panic!("hidden start must not create UI")).unwrap();
+        controller.shutdown();
+    }
+
+    #[test]
+    fn quitting_in_window_does_not_wait_for_another_tray_command() {
+        let controller = session_controller(false, true);
+        run_window_sessions(&controller, || {
+            controller.shutdown();
+            Ok(())
+        })
+        .unwrap();
+        assert!(controller.is_quitting());
+    }
+
+    #[test]
+    fn failed_window_creation_releases_context() {
+        let controller = session_controller(false, true);
+        let result = run_window_sessions(&controller, || {
+            controller.set_repaint_context(egui::Context::default());
+            Err(eframe::Error::AppCreation("test failure".into()))
+        });
+        assert!(result.is_err());
+        assert!(controller.inner.repaint_ctx.lock().unwrap().is_none());
+        controller.shutdown();
+    }
+
+    #[test]
     fn backend_error_updates_state_without_panic() {
         let snapshot = Arc::new(Mutex::new(AppSnapshot::default()));
         let backend = UnsupportedBackend::new("test backend unavailable");
@@ -854,7 +1141,7 @@ mod tests {
             AppConfig::default(),
             Arc::new(UnsupportedBackend::new("test backend unavailable")),
         );
-        let (update_tx, update_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::sync_channel(1);
 
         controller.set_tray_update_sender(Some(update_tx));
         controller.request_tray_update();

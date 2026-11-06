@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    mem, ptr,
-    sync::mpsc::{self, Receiver},
-    thread,
-};
+use std::{collections::HashMap, mem, ptr, sync::mpsc, thread};
 
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -35,7 +30,6 @@ use super::TrayHandle;
 
 const TRAY_UID: u32 = 1;
 const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
-const WM_TRAY_UPDATE: u32 = WM_APP + 2;
 const WM_TRAY_SHUTDOWN: u32 = WM_APP + 3;
 const WM_TRAY_OPEN_WINDOW: u32 = WM_APP + 4;
 
@@ -81,23 +75,11 @@ pub fn start_tray(controller: AppController) -> TrayHandle {
         Ok(None) | Err(_) => return TrayHandle::unavailable(),
     };
 
-    let (update_tx, update_rx) = mpsc::channel();
-    spawn_update_forwarder(update_rx, hwnd);
-
-    TrayHandle::available(update_tx, move || unsafe {
+    // The native menu reads a fresh snapshot when opened. No update queue or
+    // forwarding thread is needed while the tray is idle.
+    TrayHandle::available(None, move || unsafe {
         PostMessageW(hwnd as HWND, WM_TRAY_SHUTDOWN, 0, 0);
     })
-}
-
-fn spawn_update_forwarder(update_rx: Receiver<()>, hwnd: isize) {
-    thread::spawn(move || {
-        while update_rx.recv().is_ok() {
-            let ok = unsafe { PostMessageW(hwnd as HWND, WM_TRAY_UPDATE, 0, 0) };
-            if ok == 0 {
-                break;
-            }
-        }
-    });
 }
 
 fn run_tray_thread(
@@ -416,7 +398,6 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
-        WM_TRAY_UPDATE => 0,
         WM_TRAY_OPEN_WINDOW => {
             (*tray).controller.request_open_window();
             0
@@ -522,7 +503,7 @@ fn best_ico_image(ico: &[u8], desired_size: u16) -> Option<&[u8]> {
     let mut best = None;
     let mut best_score = u16::MAX;
 
-    for entry in entries.chunks_exact(16) {
+    for entry in entries.as_chunks::<16>().0 {
         let width = if entry[0] == 0 { 256 } else { entry[0] as u16 };
         let height = if entry[1] == 0 { 256 } else { entry[1] as u16 };
         if width != height {
