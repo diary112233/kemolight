@@ -6,9 +6,8 @@ use windows_sys::{
     core::BOOL,
     Win32::{
         Devices::Display::{
-            DestroyPhysicalMonitor, DestroyPhysicalMonitors, GetMonitorBrightness,
-            GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
-            SetMonitorBrightness, PHYSICAL_MONITOR,
+            DestroyPhysicalMonitor, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
+            GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, PHYSICAL_MONITOR,
         },
         Foundation::{HANDLE, LPARAM, RECT},
         Graphics::Gdi::{
@@ -380,29 +379,31 @@ impl PhysicalMonitorArray {
             });
         }
 
-        let mut monitors = vec![PHYSICAL_MONITOR::default(); count as usize];
-        let ok = unsafe { GetPhysicalMonitorsFromHMONITOR(hmonitor, count, monitors.as_mut_ptr()) };
+        let mut array = Self {
+            monitors: vec![PHYSICAL_MONITOR::default(); count as usize],
+        };
+        let ok = unsafe {
+            GetPhysicalMonitorsFromHMONITOR(hmonitor, count, array.monitors.as_mut_ptr())
+        };
         if ok == 0 {
             return Err(ddcci_error("failed to get physical monitors"));
         }
 
-        Ok(Self { monitors })
+        Ok(array)
     }
 }
 
 impl Drop for PhysicalMonitorArray {
     fn drop(&mut self) {
-        if self.monitors.is_empty() {
-            return;
-        }
-
-        unsafe {
-            DestroyPhysicalMonitors(self.monitors.len() as u32, self.monitors.as_ptr());
+        for monitor in &self.monitors {
+            if !monitor.hPhysicalMonitor.is_null() {
+                unsafe { DestroyPhysicalMonitor(monitor.hPhysicalMonitor) };
+            }
         }
     }
 }
 
-fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
+fn enumerate_logical_monitors() -> Result<Vec<HMONITOR>> {
     let mut hmonitors = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(
@@ -415,30 +416,36 @@ fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
     if ok == 0 {
         return Err(ddcci_error("failed to enumerate display monitors"));
     }
+    Ok(hmonitors)
+}
 
+fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
     let mut monitors = Vec::new();
-    for (logical_index, hmonitor) in hmonitors.into_iter().enumerate() {
+    for (logical_index, hmonitor) in enumerate_logical_monitors()?.into_iter().enumerate() {
         let device_instance = monitor_device_instance(hmonitor);
         let hardware_id = device_instance.as_ref().and_then(|instance| {
             hardware_id_from_device_instance(
                 &instance.trim_start_matches(r"\\?\").replace('#', "\\"),
             )
         });
-        let physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
-        for (physical_index, physical_monitor) in physical_monitors.monitors.iter().enumerate() {
+        let mut physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
+        for (physical_index, physical_monitor) in physical_monitors.monitors.iter_mut().enumerate()
+        {
             let description = physical_monitor.szPhysicalMonitorDescription;
-            monitors.push(PhysicalMonitor {
+            let monitor = PhysicalMonitor {
                 address: MonitorAddress {
                     logical_index,
                     physical_index,
                 },
-                handle: physical_monitor.hPhysicalMonitor,
                 description: wide_to_string(&description),
                 hardware_id: hardware_id.clone(),
                 device_instance: device_instance.clone(),
-            });
+                handle: physical_monitor.hPhysicalMonitor,
+            };
+            // The individual monitor now owns this handle. The array still owns its buffer.
+            physical_monitor.hPhysicalMonitor = ptr::null_mut();
+            monitors.push(monitor);
         }
-        mem::forget(physical_monitors);
     }
 
     Ok(monitors)
@@ -456,6 +463,10 @@ unsafe extern "system" fn enum_monitor(
 }
 
 fn monitor_device_instance(hmonitor: HMONITOR) -> Option<String> {
+    monitor_device_path(hmonitor, false)
+}
+
+fn monitor_device_path(hmonitor: HMONITOR, require_unique: bool) -> Option<String> {
     let mut monitor_info = MONITORINFOEXW::default();
     monitor_info.monitorInfo.cbSize = mem::size_of::<MONITORINFOEXW>() as u32;
 
@@ -476,7 +487,48 @@ fn monitor_device_instance(hmonitor: HMONITOR) -> Option<String> {
     }
 
     let instance = wide_to_string(&device.DeviceID).to_ascii_uppercase();
+    // In clone mode a logical monitor can be shared by multiple physical screens.
+    device.cb = mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    if require_unique
+        && unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 1, &mut device, 1) } != 0
+    {
+        return None;
+    }
     (!instance.is_empty()).then_some(instance)
+}
+
+pub(crate) fn monitor_targets(displays: &[DisplayInfo]) -> Vec<(isize, DisplayId)> {
+    enumerate_logical_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|monitor| {
+            let path = monitor_device_path(monitor, true)?;
+            display_for_monitor(displays, &path).map(|id| (monitor as isize, id.clone()))
+        })
+        .collect()
+}
+
+fn display_for_monitor<'a>(displays: &'a [DisplayInfo], path: &str) -> Option<&'a DisplayId> {
+    let ddcci_prefix = format!("{ID_PREFIX}{path}:");
+    // A device interface path ends in a class GUID. WMI uses the PnP instance
+    // name for the same device, followed by a provider instance index.
+    let wmi_instance = path
+        .strip_prefix(r"\\?\")
+        .and_then(|path| path.rsplit_once("#{"))
+        .map(|(instance, _)| instance.replace('#', "\\"));
+    let mut matches = displays.iter().filter(|display| {
+        let id = display.id.as_str();
+        id.starts_with(&ddcci_prefix)
+            || wmi_instance.as_deref().is_some_and(|instance| {
+                id.strip_prefix(WMI_ID_PREFIX)
+                    .and_then(|id| id.rsplit_once('_'))
+                    .is_some_and(|(device, index)| {
+                        device == instance && index.parse::<u32>().is_ok()
+                    })
+            })
+    });
+    let display = matches.next()?;
+    (display.supported && matches.next().is_none()).then_some(&display.id)
 }
 
 fn find_monitor(display_id: &DisplayId) -> Result<PhysicalMonitor> {
@@ -564,6 +616,43 @@ mod tests {
         );
         assert!(wmi_instance_name(&DisplayId::new("windows-wmi:3")).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn wheel_targets_match_device_instances_and_skip_ambiguous_or_unsupported_screens() {
+        let mut displays = parse_wmi_list("0|60|DISPLAY\\SAME123\\PORT1_0\n");
+        let external_path = r"\\?\DISPLAY#SAME123#PORT2#{E6F07B5F-EE97-4A90-B076-33F57BF4EAA7}";
+        let external_id = DisplayId::new(format!("{ID_PREFIX}{external_path}:0"));
+        displays.push(DisplayInfo {
+            id: external_id.clone(),
+            name: "External".into(),
+            kind: DisplayKind::ExternalDdcCi,
+            current: Some(70),
+            max: 100,
+            supported: true,
+        });
+
+        let internal_path = r"\\?\DISPLAY#SAME123#PORT1#{E6F07B5F-EE97-4A90-B076-33F57BF4EAA7}";
+        assert_eq!(
+            display_for_monitor(&displays, internal_path),
+            Some(&displays[0].id)
+        );
+        assert_eq!(
+            display_for_monitor(&displays, external_path),
+            Some(&external_id)
+        );
+        assert_eq!(
+            display_for_monitor(&displays, r"\\?\DISPLAY#SAME123#PORT3#{GUID}"),
+            None
+        );
+
+        displays[1].supported = false;
+        assert_eq!(display_for_monitor(&displays, external_path), None);
+        displays[1].supported = true;
+        let mut second = displays[1].clone();
+        second.id = DisplayId::new(format!("{ID_PREFIX}{external_path}:1"));
+        displays.push(second);
+        assert_eq!(display_for_monitor(&displays, external_path), None);
     }
 
     #[test]

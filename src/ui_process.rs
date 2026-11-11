@@ -491,9 +491,12 @@ fn run_child() -> io::Result<()> {
     result.map_err(|error| io::Error::other(error.to_string()))
 }
 
-/// Called before acquiring the single-instance mutex. UI children use only the
-/// pipes supplied by their owner, and never create a tray or hardware backend.
+/// Called before acquiring the single-instance mutex. UI children never create
+/// a tray or hardware backend.
 pub fn run_child_if_requested() -> bool {
+    if crate::brightness_overlay::run_child_if_requested() {
+        return true;
+    }
     if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new(CHILD_ARGUMENT)) {
         return false;
     }

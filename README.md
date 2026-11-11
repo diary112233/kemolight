@@ -55,6 +55,7 @@ Log out and back in after changing groups. If `ddcutil detect` reports permissio
 - External monitors: Windows Monitor Configuration API over DDC/CI.
 - Only monitors that report brightness support through Windows DDC/CI APIs are enabled. Unsupported monitors are listed but their controls are disabled.
 - Global shortcuts: **Shift+Win+B** applies the Bright profile; **Shift+Win+D** applies the Dark profile, including while hidden to the tray. A shortcut conflict is reported in the main window; tray and toolbar controls remain available.
+- **Shift+Win+mouse wheel** adjusts the supported display under the pointer, including in tray mode. Each notch uses `brightness_step`. A small brightness bar appears at the bottom of that screen after scrolling. Its separate process exits automatically when scrolling stops. The wheel passes through when the app cannot identify a single controllable display at the pointer.
 - The tray/hardware controller and UI use separate processes of the same executable. Hiding or closing the window exits the UI process and releases its graphics driver resources. Opening it again restores its size, position, and current state from the controller.
 
 External monitors must have DDC/CI enabled in the monitor OSD. Some HDMI/DP adapters, docks, KVMs, GPU drivers, HDR modes, and vendor utilities can block or interfere with DDC/CI brightness commands.

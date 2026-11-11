@@ -41,6 +41,25 @@ pub struct AppSnapshot {
     pub profile_error: Option<String>,
     pub hotkey_error: Option<String>,
     pub(crate) lid_closed: bool,
+    #[cfg(target_os = "windows")]
+    #[serde(skip)]
+    pub(crate) monitor_targets: Vec<(isize, DisplayId)>,
+    #[cfg(target_os = "windows")]
+    #[serde(skip)]
+    pub(crate) monitor_generation: u64,
+}
+
+#[cfg(target_os = "windows")]
+impl AppSnapshot {
+    fn wheel_target(&self, monitor: isize) -> Option<&DisplayState> {
+        let (_, id) = self
+            .monitor_targets
+            .iter()
+            .find(|(handle, _)| *handle == monitor)?;
+        self.displays
+            .iter()
+            .find(|display| display.info.id == *id && display.info.supported)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +470,53 @@ impl AppController {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wheel_target_generation(&self, monitor: isize) -> Option<u64> {
+        // This runs in the mouse hook. Contention must never block input.
+        let snapshot = self.inner.snapshot.try_lock().ok()?;
+        snapshot.wheel_target(monitor)?;
+        Some(snapshot.monitor_generation)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn adjust_wheel_target(
+        &self,
+        monitor: isize,
+        generation: u64,
+        delta: i32,
+    ) -> Option<u32> {
+        let id = {
+            let snapshot = self.inner.snapshot.lock().ok()?;
+            if snapshot.monitor_generation != generation {
+                return None;
+            }
+            snapshot.wheel_target(monitor)?.info.id.clone()
+        };
+        self.adjust_brightness(id, delta);
+        self.wheel_brightness(monitor, generation)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn wheel_brightness(&self, monitor: isize, generation: u64) -> Option<u32> {
+        let snapshot = self.inner.snapshot.lock().ok()?;
+        if snapshot.monitor_generation != generation {
+            return None;
+        }
+        let display = snapshot.wheel_target(monitor)?;
+        if display.error.is_some() {
+            return None;
+        }
+        display.info.current
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn invalidate_monitor_targets(&self) {
+        if let Ok(mut snapshot) = self.inner.snapshot.lock() {
+            snapshot.monitor_targets.clear();
+            snapshot.monitor_generation = snapshot.monitor_generation.wrapping_add(1);
+        }
+    }
+
     pub fn preview_brightness(&self, display_id: DisplayId, value: u32) -> u64 {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         update_pending_brightness(
@@ -798,10 +864,25 @@ fn notify_tray_changed(tray_update_tx: &Arc<Mutex<Option<SyncSender<()>>>>) {
 }
 
 fn refresh_snapshot(backend: &dyn BrightnessBackend, snapshot: &Arc<Mutex<AppSnapshot>>) {
+    #[cfg(target_os = "windows")]
+    let generation = match snapshot.lock() {
+        Ok(snapshot) => snapshot.monitor_generation,
+        Err(_) => return,
+    };
     let result = backend.list_displays();
+    #[cfg(target_os = "windows")]
+    let targets = result
+        .as_deref()
+        .map(crate::brightness::windows::monitor_targets)
+        .unwrap_or_default();
     let Ok(mut snapshot) = snapshot.lock() else {
         return;
     };
+    #[cfg(target_os = "windows")]
+    if generation == snapshot.monitor_generation && targets != snapshot.monitor_targets {
+        snapshot.monitor_targets = targets;
+        snapshot.monitor_generation = generation.wrapping_add(1);
+    }
 
     match result {
         Ok(displays) => {
@@ -1219,6 +1300,36 @@ mod tests {
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .expect("brightness worker did not finish");
             }
+        }
+
+        #[test]
+        #[cfg(target_os = "windows")]
+        fn wheel_adjusts_only_the_target_and_rejects_a_reused_monitor_handle() {
+            let backend = Arc::new(MockBrightnessBackend::default());
+            let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+            wait_until_idle(&controller);
+
+            let internal = DisplayId::new("mock:internal");
+            let external = DisplayId::new("mock:external");
+            controller.inner.snapshot.lock().unwrap().monitor_targets =
+                vec![(1, internal.clone()), (2, external.clone())];
+            let generation = controller.wheel_target_generation(2).unwrap();
+            assert_eq!(controller.adjust_wheel_target(2, generation, 2), Some(80));
+            wait_until_idle(&controller);
+            assert_eq!(backend.get_brightness(&internal).unwrap().percent(), 60);
+            assert_eq!(backend.get_brightness(&external).unwrap().percent(), 80);
+
+            controller.invalidate_monitor_targets();
+            controller.inner.snapshot.lock().unwrap().monitor_targets = vec![(2, internal.clone())];
+            assert_ne!(controller.wheel_target_generation(2), Some(generation));
+            assert_eq!(controller.adjust_wheel_target(2, generation, -1), None);
+            assert!(!controller
+                .snapshot()
+                .displays
+                .iter()
+                .any(|display| display.pending));
+            assert_eq!(backend.get_brightness(&internal).unwrap().percent(), 60);
+            controller.shutdown();
         }
 
         #[test]
