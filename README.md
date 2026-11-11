@@ -113,6 +113,10 @@ cargo run
 
 ## Configuration
 
+On Windows and Linux, enable **Settings → Start at sign-in** to register KemoLight for the current user. The option is off by default and requires no administrator privileges. At sign-in, KemoLight starts in the tray when available and opens its window if the tray is unavailable.
+
+The startup entry uses the current executable's location. If you move KemoLight, toggle the option off and on from the new location.
+
 Config is read from:
 
 ```text

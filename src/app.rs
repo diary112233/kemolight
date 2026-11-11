@@ -634,10 +634,11 @@ impl AppController {
 }
 
 pub fn run() {
-    let config = AppConfig::load().unwrap_or_else(|err| {
+    let mut config = AppConfig::load().unwrap_or_else(|err| {
         eprintln!("Failed to load config, using defaults: {err}");
         AppConfig::default()
     });
+    config.start_hidden |= crate::config::start_hidden_requested();
     // The brightness worker performs initial discovery before processing commands.
     let controller = AppController::new(config);
 

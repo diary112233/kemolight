@@ -18,6 +18,14 @@ pub struct MainWindow {
     controller: AppController,
     visible: bool,
     quitting: bool,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    startup_setting: Option<StartupSetting>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct StartupSetting {
+    enabled: Option<bool>,
+    error: Option<String>,
 }
 
 impl MainWindow {
@@ -26,6 +34,8 @@ impl MainWindow {
             controller,
             visible,
             quitting: false,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            startup_setting: None,
         }
     }
 
@@ -161,6 +171,9 @@ impl MainWindow {
                 ui.weak("Saves each connected display separately.");
             });
 
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            self.render_settings_menu(ui);
+
             let hide_label = if self.controller.tray_available() {
                 "Hide to Tray"
             } else {
@@ -178,6 +191,55 @@ impl MainWindow {
                 self.quit(ui.ctx());
             }
         });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn render_settings_menu(&mut self, ui: &mut egui::Ui) {
+        let config = egui::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (_, menu) = egui::menu::MenuButton::new("Settings")
+            .config(config)
+            .ui(ui, |ui| {
+                let setting = self.startup_setting.get_or_insert_with(|| {
+                    match crate::startup::is_enabled() {
+                        Ok(enabled) => StartupSetting {
+                            enabled: Some(enabled),
+                            error: None,
+                        },
+                        Err(error) => StartupSetting {
+                            enabled: None,
+                            error: Some(format!("Could not read startup setting: {error}")),
+                        },
+                    }
+                });
+
+                let mut checked = setting.enabled.unwrap_or_default();
+                if ui
+                    .add_enabled(
+                        setting.enabled.is_some(),
+                        egui::Checkbox::new(&mut checked, "Start at sign-in"),
+                    )
+                    .changed()
+                {
+                    match crate::startup::set_enabled(checked) {
+                        Ok(()) => {
+                            setting.enabled = Some(checked);
+                            setting.error = None;
+                        }
+                        Err(error) => {
+                            setting.error =
+                                Some(format!("Could not change startup setting: {error}"));
+                        }
+                    }
+                }
+
+                if let Some(error) = &setting.error {
+                    ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
+                }
+            });
+        if menu.is_none() {
+            self.startup_setting = None;
+        }
     }
 
     fn render_display_row(&mut self, ui: &mut egui::Ui, display: DisplayState) {
